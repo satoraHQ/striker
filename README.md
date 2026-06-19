@@ -1,142 +1,161 @@
 # Striker
 
-**A trade execution layer for Arkade's non-interactive swap protocol**
+**An intent-based swap layer for Arkade — NEAR Intents, settled with recursive covenants.**
 
 ---
 
-## The Problem
+## The idea in one breath
 
-A non-interactive swap protocol requires **takers to do all the heavy lifting**:
+A maker deposits liquidity once into a covenant and signs quotes off-chain. A user asks Striker for
+a price; Striker polls the makers; the best signed quote comes back. The user locks their funds in a
+covenant that guarantees they receive at least the quoted amount, and an atomic transaction settles
+the swap. The maker never has to be online to be filled, and Striker never custodies a satoshi.
 
-```
-┌─────────┐     ┌──────────────────┐     ┌─────────────┐
-│  Maker  │────>│  Virtual Mempool │<────│    Taker    │
-│         │     │   (Orderbook)    │     │             │
-└─────────┘     └──────────────────┘     └──────┬──────┘
-                                                │
-                                         1. Sync full orderbook locally
-                                         2. Find matching orders
-                                         3. Handle partial fills manually
-                                         4. Construct spend tx
-                                         5. Submit - hope VTXO isn't stale
-```
-
-**This breaks down in practice:**
-
-- Users must **rebuild the orderbook locally** before every trade
-- By the time a slow client constructs a valid spend tx, the **VTXO may already be spent**
-- No way to aggregate partial fills or route across multiple orders
-- Every taker is on their own - no bundling of multiple orders
+It's [NEAR Intents](https://docs.near-intents.org), rebuilt on Bitcoin: the quote lives in a signed
+message, not in an on-chain order, and the chain itself does the accounting.
 
 ---
 
-## The Solution: A Matching Engine
+## Why the previous model didn't scale
 
-An **execution service** with a live, authoritative view of the orderbook that matches and executes trades on behalf of
-users.
+The earlier design encoded each quote *inside* a covenant script and posted it as a VTXO — an
+orderbook made of on-chain outputs. That forces takers to sync the whole book, race against stale
+VTXOs, and rebuild state before every trade. The matching engine helps, but the fundamental problem
+remains: **the price is welded to a specific output**, so every requote is an on-chain action and
+every taker is racing a moving book.
+
+The fix is to move the quote off-chain and make the covenant generic.
+
+---
+
+## How it works
+
+```
+0. Maker deposits funds into a recursive covenant (once).
+1. User wants to sell 100 BTC for USDT.
+2. User asks Striker for a quote.
+3. Striker polls all makers.
+4. Each maker returns a SIGNED MESSAGE authorizing "take X of my USDT if Y BTC goes to my address".
+5. Striker returns the best quote to the user.
+6. User locks 100 BTC in a covenant that enforces "I receive at least the quoted USDT".
+   → One atomic tx spends both covenants and settles the swap.
+```
+
+The key inversion: **the quote is encoded in the redeem data of the spend, not in the covenant
+script.** The maker's covenant is a generic, reusable rule — "spend `X` if I signed a message
+authorizing it and `Y` is paid to my address" — built on `OP_CHECKSIGFROMSTACK`. A single deposit
+can satisfy any quote the maker chooses to sign, without ever re-posting.
 
 ```mermaid
 graph LR
-subgraph Makers
-M1[Maker A<br/>Sell 100k sats @ 10 USD]
-M2[Maker B<br/>Sell 50k sats @ 9.80 USD]
-end
+  subgraph Makers
+    M[Maker<br/>deposits once into<br/>a recursive covenant]
+  end
+  subgraph Striker
+    R[Quote router<br/>+ lineage tracker]
+    TX[Settlement tx<br/>construction]
+  end
+  subgraph Emulator
+    E[Stateless co-signer<br/>validates covenant → signs]
+  end
+  U[User / Taker]
 
-M1 -->|post VTXO|VM[Arkade Virtual<br/>Mempool]
-M2 -->|post VTXO|VM
-
-subgraph Satora Striker
-OB[Live Orderbook<br/>State]
-ME[Order Matching<br/>& Routing]
-TX[Tx Construction]
-end
-
-VM -->|subscribe / stream VTXOs|OB
-OB --> ME
-
-subgraph Takers
-T1[Taker X<br/>Buy 120k sats]
-T2[Taker Y<br/>Sell 80k sats]
-end
-
-T1 -->|market order / quote|ME
-T2 -->|market order / quote|ME
-ME --> TX
-TX -->|request co - sign|INT[Introspector<br/>Covenant Verification]
-INT -->|co - signed tx|VM
+  U -->|1. quote request| R
+  R -->|2. poll| M
+  M -->|3. signed quote M| R
+  R -->|4. best quote| U
+  U -->|5. lock funds in user covenant| TX
+  R --> TX
+  TX -->|6. validate| E
+  E -->|signatures| TX
+  TX -->|settle| ARKD[arkd / Arkade]
 ```
 
-**How it works:** Makers post VTXOs with covenant scripts (limit orders) directly to the Arkade virtual mempool - no
-interaction with Satora Striker needed.
-Satora Striker **subscribes** to the mempool, indexes incoming VTXOs, and builds a live orderbook from them.
-When a taker submits an order, Striker matches it, constructs the spend tx, and sends it to the **Introspector**.
-The Introspector verifies the covenant is respected and co-signs - only then does the tx settle.
+---
+
+## The fungible covenant — the whole trick
+
+A maker's deposit is a **recursive, state-carrying covenant**. When it's filled, the spend:
+
+- pays `X` of the asset to the taker,
+- pays `Y` to the maker's address,
+- and sends the **change back into an identical covenant**.
+
+So the deposit behaves like a NEAR-style fungible balance: each fill draws it down, the remainder
+chains forward, and one deposit fills many quotes in sequence. The balance is just the VTXO value;
+an **epoch** counter rides in the covenant so the maker can bulk-cancel its own outstanding quotes
+with a single self-spend.
+
+This is the part that makes intents work on a UTXO chain. The mechanism — recursive covenants,
+state-carrying packets, `OP_CHECKSIGFROMSTACK`, BigNum arithmetic — is all confirmed against
+[arkade-os/emulator](https://github.com/arkade-os/emulator). Full spec in **[DESIGN.md](./DESIGN.md)**.
 
 ---
 
-## Advantages of this service
+## How over-commitment is prevented
 
-| Without Engine              | With Engine                               |
-|-----------------------------|-------------------------------------------|
-| Taker syncs full orderbook  | Engine maintains live state               |
-| Manual order discovery      | Price-time priority matching              |
-| Single order per tx         | Partial fill aggregation across orders    |
-| Stale VTXOs = failed trades | Engine knows real-time VTXO liveness      |
-| No cross-pair routing       | Multi-hop trades (e.g. BTC -> USD -> EUR) |
-| Client builds spend tx      | Engine constructs optimized tx            |
+A maker can sign unlimited overlapping quotes against the same deposit. Only one fill can settle —
+spending the deposit consumes it, and Arkade's single-spend rule makes every competing fill fail.
+This is the same guarantee NEAR gets from atomic check-and-debit, except the enforcer is the chain,
+not a contract:
 
-**The core insight:** the matching engine has an information advantage.
-It sees the live state of all VTXOs, can pre-validate spendability, and construct transactions against orders it *knows*
-are still valid.
-Individual clients racing against a changing orderbook cannot compete with this.
-
----
-
-## Feature Set
-
-**Core (v1)**
-
-- Limit orders (maker)
-- Market orders (taker) - fill at best available price
-- Partial fill aggregation - combine multiple small orders into one trade
-- Price-time priority matching
-- Quote API - "how much BTC for 50 USD?" / "how much USD for 100k sats?"
-
-**Extended (v2)**
-
-- Batch execution - group multiple fills into optimized transactions
-- Maker-to-maker matching - two limit orders that cross each other
-- Multi-hop routing - swap through intermediate pairs
-- `amountIn` / `amountOut` quote modes (Uniswap-style interface)
-- 'Register' with XPUB to track trades and reduce trading fees by volume
+| NEAR Intents | Striker |
+|---|---|
+| Solver signs a `token_diff` intent | Maker signs a quote, verified via `OP_CHECKSIGFROMSTACK` |
+| Stable fungible balance in the Verifier | Recursive covenant — change chains the balance forward |
+| Atomic check-and-debit (`execute_intents`) | Arkade VTXO single-spend |
+| Global salt rotation to cancel | Maker bumps its own epoch (per-lineage, self-sovereign) |
+| Verifier validates **and** executes | Emulator validates (stateless); `arkd` executes |
+| Nonce state in contract storage | State on-chain in the covenant — no database |
 
 ---
 
-## Fee Model
+## Trust model
 
-**Taker-pays, basis-point fee on execution.**
+Striker is a convenience layer, not a custodian.
 
-|        | Fee        | Rationale                                                |
-|--------|------------|----------------------------------------------------------|
-| Makers | 0 bps      | Incentivize liquidity - makers provide the orderbook     |
-| Takers | ~10-30 bps | Takers pay for execution quality, speed, and reliability |
-
-Fee is embedded in the constructed transaction - transparent and verifiable.
+- **Striker** is untrusted. It routes quotes and builds transactions; it cannot steal or alter terms
+  because the covenants and the Emulator enforce them. If it goes down, users fall back to manual
+  interaction.
+- **The Emulator** co-signs every spend, validating the covenant in software. It holds no state and
+  cannot steal — at worst it can censor, and the backstop is the Arkade unilateral exit to L1.
+- **Makers** are fully self-sovereign: withdraw or requote at any time via a key path.
+- **Users** lock funds behind a covenant that guarantees the quoted amount, with a **non-timelocked
+  refund** they can take any time the swap hasn't settled.
 
 ---
 
-**Trust model:** Satora Striker is a convenience layer, not a custodian.
-The **Introspector** co-signs every transaction - it verifies the maker's covenant is respected before the tx is
-submitted.
-If the terms aren't met, the Introspector refuses to sign and the tx never hits the mempool.
-The engine cannot steal funds or alter terms.
-Worst case: the engine goes down, users fall back to manual orderbook interaction.
+## Feature set
+
+**v1**
+- Off-chain signed quotes (RFQ) over a generic, reusable maker covenant
+- Recursive fungible deposits — one deposit fills many quotes
+- Partial-fill aggregation — multiple maker inputs in one settlement tx
+- Quote API — "how much USDT for 100k sats?" / "how much BTC for 50 USD?"
+- Self-sovereign maker cancel (epoch bump) and withdraw
+
+**v2**
+- Rate-based quotes (`required_Y = X · rate`) — feasible today via BigNum multiplication
+- Multi-hop routing (BTC → USD → EUR)
+- Maker-to-maker matching
+- `amountIn` / `amountOut` quote modes
+- XPUB registration for volume-tiered taker fees
+
+---
+
+## Fee model
+
+**Taker-pays, basis points on execution.** Makers pay 0 bps to incentivize liquidity; takers pay
+~10–30 bps for execution quality and speed. The fee is an output in the settlement tx — transparent
+and verifiable.
 
 ---
 
 ## Summary
 
-Assuming the swap primitives exist: covenants scripts and the Introspector, the missing piece is a service that ties them together into something users actually want to trade on.
-Striker is that piece: it watches the mempool, matches orders, builds transactions, and gets them co-signed.
-Users get fast, reliable fills.
+Assuming Arkade's swap primitives — recursive covenants, the Emulator, `OP_CHECKSIGFROMSTACK` — the
+missing piece is a service that ties them into something people can trade on. Striker is that piece:
+it routes quotes, tracks maker liquidity, builds settlement transactions, and gets them co-signed.
+Users get fast, reliable, non-custodial fills.
 
+See **[DESIGN.md](./DESIGN.md)** for the full mechanism.
