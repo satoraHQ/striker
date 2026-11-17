@@ -334,7 +334,7 @@ Before any service code, prove the covenants against the emulator and arkd on re
 
 ## 15. Spike results
 
-All 54 tests pass on regtest (fresh stack) (arkd v0.9.25 with a standalone signer and postgres+redis,
+All 54 tests pass on a fresh regtest stack (arkd v0.9.25 with a standalone signer and postgres+redis,
 upstream emulator v0.0.10-rc.0, `@arkade-os/sdk` 0.5.6); see `spike/`.
 
 | §13 item | Result |
