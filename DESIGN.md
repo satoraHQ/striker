@@ -144,7 +144,7 @@ slippage), `fee_bps`, `deadline` (≈ 10 min), `refund_pubkey`.
 ## 6. Dust rule
 
 Quoted amounts never include carrier dust. Every output's dust is paid by whoever owns that
-output. The dust value comes from arkd's server info at runtime (the old PoC hard-coded 330).
+output. The dust value comes from arkd's `/v1/info` at runtime (currently 330 sats on mainnet and Mutinynet).
 
 | Taker action | Taker outputs |
 |---|---|
@@ -165,6 +165,7 @@ it out (§4).
 - Swap-covenant takers don't sign anything, so batching them is easy. Direct-fill takers must
   each sign the final transaction. If someone misses the signing timeout, the batch is
   rebuilt without them.
+- Batch size is bounded by arkd's `maxTxWeight` (currently 40 000 weight units).
 - When a maker VTXO is spent by a competing transaction, the single-spend rule rejects the
   loser. Striker re-sweeps and retries.
 - Chained fills inherit the inputs' earliest VTXO expiry. Renewal is covered in §8.
@@ -181,8 +182,13 @@ based on the emulator's non-interactive delegate pattern (`test/delegate_test.go
 - Striker acts as delegate and renews offer covenants before expiry, triggered by
   `OP_PUSHEXPIRY`-aware scheduling. Swap covenants are short-lived and normally settle or
   refund before needing renewal.
-- **Open:** batch fees. `OP_TUNNEL` keeps value exact, so either Striker pays from taker fees
-  (the v2 default) or a capped fee deduction is allowed.
+- **Fees: renewal is free inside the server's renewal window.** arkd's intent fee program
+  charges an off-chain VTXO input 0.2 % only while it still has a long life left:
+  `inputType == 'vtxo' && expiry - now() > W ? amount * 0.002 : 0.0`. W is 2 505 216 s
+  (≈ 29 days) on mainnet and 518 656 s (≈ 6 days) on Mutinynet, and `txFeeRate` is 0 on both
+  (checked against `/v1/info`, 2026-11-17). So Striker renews only within the last W seconds
+  before expiry, and `OP_TUNNEL`'s exact-value rule holds. Striker reads the fee program at
+  runtime and skips renewal if it would cost anything.
 
 ## 9. Fees
 
@@ -239,7 +245,7 @@ Before any service code, prove the covenants against the emulator and arkd on re
    Does the emulator submit itself, or can a signed transaction be held?
 3. **Floor:** holds across three chained partial fills. `min_fill` is enforced.
 4. **Epoch bump** via the owner leaf cancels all outstanding quotes.
-5. **Two-asset offer VTXO:** arkd accepts sats plus demo USD on one covenant VTXO. Fills in both directions.
+5. **Two-asset offer VTXO:** sats plus demo USD on one covenant VTXO (expected to work). Fills in both directions.
 6. **Two makers, several takers, one transaction:** index pairing prevents counting one output twice. Measure the size limit.
 7. **Dust:** sell everything but dust, buy back with a whole token VTXO, exact sats both ways.
    A transaction where the taker pays the maker's dust is rejected.
@@ -251,7 +257,6 @@ Before any service code, prove the covenants against the emulator and arkd on re
 
 ## 14. Open questions
 
-- Batch fee for renewal (§8).
 - Signing-round timeout for direct-fill batching.
 - Default quote lifetime for maker bots.
 - External wallet signing API.
