@@ -3,10 +3,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { coinAt, coinsAt, connect, disposeWallets, submit, secret, waitFor,
-  type Chain, type TestWallet } from './harness.js';
-import { BTC, assetBytes, assetIdsOf, buildTx, demoUsd, ensureFunded, sweepOffer, expectError, finalWeight, makerLeg, minReceived, offerTree, ownerInput, signQuote,
-  refusedExplained, submitExplained, submitToArkd, usdOf, walletCoins, walletInput, type Coin, type FillPlan, type Offer, type Quote, type TxOutput } from './offer.js';
+import { coinAt, coinsAt, connect, disposeWallets, refused, regtest, secret, submitBuilt, submitToArkd, waitFor, walletCoins } from './harness.js';
+import { BTC, assetBytes, assetIdsOf, buildTx, demoUsd, ensureFunded, sweepOffer, finalWeight, makerLeg, minReceived, offerTree, ownerInput, signQuote,
+  usdOf, walletInput, type Coin, type FillPlan, type Offer, type Quote, type TxOutput } from './offer.js';
 
 const USD = 100_000_000n;                     // one demo USD in atomic units (8 decimals)
 const now = () => BigInt(Math.floor(Date.now() / 1000));
@@ -24,13 +23,24 @@ test('offer covenant: quotes, floor, epoch, two assets, dust', { timeout: 600_00
   const taker = await ensureFunded(chain, 21, 0);
   // Reclaim offer VTXOs left by earlier runs (owner leaf, epochs 0 and 1), then top up if short.
   for (const id of await assetIdsOf(chain, maker)) for (const epoch of [0n, 1n]) await sweepOffer(chain, offerTree(chain, maker.publicKey, epoch, id), maker);
-  await ensureFunded(chain, 20, 400_000); await ensureFunded(chain, 21, 400_000);
+  await ensureFunded(chain, 20, 400_000);
+  // The taker pays two 100 000-sat fills from one coin; give it a fresh 400 000-sat coin when no coin can.
+  // Tests 5 and 7 pay two ~100 000-sat fills from one coin, so the taker needs a single large
+  // sats VTXO — a high *total* balance spread over small coins is not enough. Send one from the
+  // faucet and wait until the indexer exposes it (the SDK wallet's own balance view lags).
+  const bigSats = async () => (await walletCoins(chain, taker)).filter(v => v.value >= 250_000).sort((a, b) => b.value - a.value)[0];
+  if (!(await bigSats())) {
+    regtest('ark', 'send', '--to', taker.address, '--amount', '450000', '--password', 'secret');
+    await waitFor(bigSats, 'taker large sats coin', 60_000);
+  }
   const usd = await demoUsd(chain, maker);
   // Taker holds USD on a separate VTXO (1000 sats carrier + 50 000 USD).
   await maker.wallet.send({ address: taker.address, amount: 1_000, assets: [{ assetId: usd, amount: 50_000n * USD }] });
-  const takerUsdCoin = async () => waitFor(async () => (await walletCoins(chain, taker)).find(v => usdOf(v, usd) > 0n), 'taker USD coin');
-  /** The taker's biggest coin; it may carry USD, which the fill helper passes through. */
-  const takerSatsCoin = async () => waitFor(async () => (await walletCoins(chain, taker)).filter(v => v.value >= 500_000).sort((a, b) => b.value - a.value)[0], 'taker sats coin');
+  // The dedicated USD carrier (least sats of the taker's USD-bearing coins), so the big sats
+  // coin a reverse fill produces — which now also carries USD — is never spent as the USD leg.
+  const takerUsdCoin = async () => waitFor(async () => (await walletCoins(chain, taker)).filter(v => usdOf(v, usd) > 0n).sort((a, b) => a.value - b.value)[0], 'taker USD coin');
+  /** The taker's biggest coin able to pay a 100 000-sat fill; it may carry USD, which the fill helper passes through. */
+  const takerSatsCoin = async () => waitFor(async () => (await walletCoins(chain, taker)).filter(v => v.value >= 250_000).sort((a, b) => b.value - a.value)[0], 'taker sats coin');
 
   let offer = offerTree(chain, maker.publicKey, 0n, usd);
   const fundTxid = await maker.wallet.send({ address: offer.address, amount: 100_000, assets: [{ assetId: usd, amount: 1_000n * USD }] });
@@ -55,22 +65,21 @@ test('offer covenant: quotes, floor, epoch, two assets, dust', { timeout: 600_00
     return { offer, coin, quote, message, signature: signatureOverride ?? signature, sold, received };
   };
   const settle = async (built: Awaited<ReturnType<typeof buildTx>>) => {
-    const { txid, result } = await submitExplained(chain, built);
+    const { txid, result } = await submitBuilt(chain, built);
     coin = await coinAt(chain, offer.tree, txid);
     return { ...finalWeight(result.signedArkTx), txid };
   };
+  /** Asserts the covenant refuses the fill, with `expect` in the emulator's refusal text. */
+  const refusedFill = (built: Promise<Awaited<ReturnType<typeof buildTx>>>, expect: string | RegExp) =>
+    refused(async () => submitBuilt(chain, await built), expect);
 
   await t.test('1. quote validity', async () => {
     const q = sellBtc(offer);
-    let lines = await refusedExplained(async () => { const b = await fill(plan(q, 10_000n, randomBytes(64)), await takerUsdCoin()); return submit(chain, b.arkTx, b.checkpoints, b.prevTxids); });
-    expectError(lines, 'signature verification failed');
-    lines = await refusedExplained(async () => { const b = await fill(plan(sellBtc(offer, { epoch: 1n }), 10_000n), await takerUsdCoin()); return submit(chain, b.arkTx, b.checkpoints, b.prevTxids); });
-    expectError(lines, /EQUALVERIFY/);
-    lines = await refusedExplained(async () => { const b = await fill(plan(sellBtc(offer, { expiry: now() - 5n }), 10_000n), await takerUsdCoin()); return submit(chain, b.arkTx, b.checkpoints, b.prevTxids); });
-    expectError(lines, /OP_VERIFY|VERIFY failed/);
+    await refusedFill(fill(plan(q, 10_000n, randomBytes(64)), await takerUsdCoin()), 'signature verification failed');
+    await refusedFill(fill(plan(sellBtc(offer, { epoch: 1n }), 10_000n), await takerUsdCoin()), /OP_EQUALVERIFY failed/);
+    await refusedFill(fill(plan(sellBtc(offer, { expiry: now() - 5n }), 10_000n), await takerUsdCoin()), /OP_VERIFY failed/);
     // Underpayment by one unit is refused; the exact rounded-up amount fills.
-    lines = await refusedExplained(async () => { const b = await fill(plan(q, 10_000n, undefined, minReceived(q, 10_000n) - 1n), await takerUsdCoin()); return submit(chain, b.arkTx, b.checkpoints, b.prevTxids); });
-    expectError(lines, /VERIFY/);
+    await refusedFill(fill(plan(q, 10_000n, undefined, minReceived(q, 10_000n) - 1n), await takerUsdCoin()), /OP_VERIFY failed/);
     const r = await settle(await fill(plan(q, 10_000n), await takerUsdCoin()));
     console.log(`  fill tx (1 maker, 1 taker): weight=${r.weight} vsize=${r.vsize}`);
     assert.equal(coin.value, 90_000);
@@ -82,10 +91,8 @@ test('offer covenant: quotes, floor, epoch, two assets, dust', { timeout: 600_00
     const q = sellBtc(offer);                                               // floor 50 000, min_fill 1 000
     for (const sold of [10_000n, 10_000n, 10_000n]) await settle(await fill(plan(q, sold), await takerUsdCoin()));
     assert.equal(coin.value, 60_000);
-    let lines = await refusedExplained(async () => { const b = await fill(plan(q, 10_001n), await takerUsdCoin()); return submit(chain, b.arkTx, b.checkpoints, b.prevTxids); });
-    expectError(lines, /VERIFY/);                                           // crosses the floor
-    lines = await refusedExplained(async () => { const b = await fill(plan(q, 999n), await takerUsdCoin()); return submit(chain, b.arkTx, b.checkpoints, b.prevTxids); });
-    expectError(lines, /VERIFY/);                                           // below min_fill
+    await refusedFill(fill(plan(q, 10_001n), await takerUsdCoin()), /OP_VERIFY failed/);   // crosses the floor
+    await refusedFill(fill(plan(q, 999n), await takerUsdCoin()), /OP_VERIFY failed/);      // below min_fill
     await settle(await fill(plan(q, 10_000n), await takerUsdCoin()));       // exactly onto the floor is fine
     assert.equal(coin.value, 50_000);
   });
@@ -95,13 +102,12 @@ test('offer covenant: quotes, floor, epoch, two assets, dust', { timeout: 600_00
     const bumped = offerTree(chain, maker.publicKey, 1n, usd);
     const built = await buildTx(chain, [ownerInput(coin, offer.tree, maker.identity)],
       [{ script: bumped.tree.pkScript, amount: BigInt(coin.value), assets: [{ assetId: usd, amount: usdOf(coin, usd) }] }]);
-    const txid = await submitToArkd(chain, built.arkTx, built.checkpoints, maker.identity);
+    const { txid } = await submitToArkd(chain, built.arkTx, built.checkpoints);
     const previous = offer;
     offer = bumped;
     coin = await coinAt(chain, offer.tree, txid);
     assert.equal((await coinsAt(chain, previous.tree)).length, 0);
-    const lines = await refusedExplained(async () => { const b = await fill({ ...plan(old, 10_000n), offer }, await takerUsdCoin()); return submit(chain, b.arkTx, b.checkpoints, b.prevTxids); });
-    expectError(lines, /EQUALVERIFY/);
+    await refusedFill(fill({ ...plan(old, 10_000n), offer }, await takerUsdCoin()), /OP_EQUALVERIFY failed/);
     await settle(await fill(plan(sellBtc(offer, { floor: 10_000n }), 10_000n), await takerUsdCoin()));
     assert.equal(coin.value, 40_000);
   });
@@ -116,26 +122,18 @@ test('offer covenant: quotes, floor, epoch, two assets, dust', { timeout: 600_00
     // ... and straight back the other way on the new change.
     await settle(await fill(plan(sellBtc(offer, { floor: 10_000n }), 5_000n), await takerUsdCoin()));
     assert.equal(BigInt(coin.value), before.sats + 95_000n);
-    // Floor on the USD side: selling down to below 500 USD is refused.
-    const lines = await refusedExplained(async () => { const b = await fill(plan(q, usdOf(coin, usd) - 499n * USD), await takerSatsCoin()); return submit(chain, b.arkTx, b.checkpoints, b.prevTxids); });
-    expectError(lines, /VERIFY/);
+    // Floor on the USD side: a quote whose floor sits 50 USD below the balance refuses a 51 USD sale.
+    const floored = sellUsd(offer, { floor: usdOf(coin, usd) - 50n * USD });
+    await refusedFill(fill(plan(floored, 51n * USD), await takerSatsCoin()), /OP_VERIFY failed/);
   });
 
   await t.test('7. the maker never funds taker dust', async () => {
     // Selling USD: the taker's USD output carries 330 sats of dust taken from the maker's change.
     let q = sellUsd(offer);
-    let lines = await refusedExplained(async () => {
-      const b = await fill(plan(q, 100n * USD), await takerSatsCoin(), outs => { outs[0]!.amount -= chain.dust; outs[1]!.amount += chain.dust; });
-      return submit(chain, b.arkTx, b.checkpoints, b.prevTxids);
-    });
-    expectError(lines, /VERIFY/);
+    await refusedFill(fill(plan(q, 100n * USD), await takerSatsCoin(), outs => { outs[0]!.amount -= chain.dust; outs[1]!.amount += chain.dust; }), /OP_VERIFY failed/);
     // Selling BTC: the taker takes `sold` + dust but pays only for `sold`.
     q = sellBtc(offer, { floor: 10_000n });
-    lines = await refusedExplained(async () => {
-      const b = await fill(plan(q, 5_000n), await takerUsdCoin(), outs => { outs[0]!.amount -= chain.dust; outs[1]!.amount += chain.dust; });
-      return submit(chain, b.arkTx, b.checkpoints, b.prevTxids);
-    });
-    expectError(lines, /VERIFY/);
+    await refusedFill(fill(plan(q, 5_000n), await takerUsdCoin(), outs => { outs[0]!.amount -= chain.dust; outs[1]!.amount += chain.dust; }), /OP_VERIFY failed/);
     // Paying for the dust at the quoted rate is just a bigger fill, and that is allowed.
     await settle(await fill(plan(q, 5_000n + chain.dust), await takerUsdCoin()));
   });

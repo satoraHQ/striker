@@ -2,12 +2,11 @@
 // generic builder for fill transactions mixing covenant inputs and plain wallet inputs.
 import assert from 'node:assert/strict';
 import { arkade, asset, buildOffchainTx, EmulatorPacket, Extension, Transaction, VtxoScript,
-  matchServerCheckpoints, type ArkTxInput, type ExtendedVirtualCoin, type SingleKey, type TapLeafScript, type VirtualCoin } from '@arkade-os/sdk';
+  type ArkTxInput, type ExtendedVirtualCoin, type SingleKey, type TapLeafScript, type VirtualCoin } from '@arkade-os/sdk';
 import { RawWitness } from '@scure/btc-signer';
 import { schnorr } from '@noble/curves/secp256k1.js';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { spawnSync } from 'node:child_process';
-import { EMULATOR_CONTAINER, covenantTree, executionErrors, exitLeaf, fundedWallet, issueDemoUsd, ownerLeaf, submit, waitFor, type Chain, type TestWallet } from './harness.js';
+import { coinsAt, covenantTree, exitLeaf, fundedWallet, issueDemoUsd, ownerLeaf, submitToArkd, walletCoins, type Chain, type TestWallet } from './harness.js';
 
 type Ops = Parameters<typeof arkade.ArkadeScript.encode>[0];
 
@@ -193,16 +192,6 @@ export async function buildTx(chain: Chain, inputs: TxInput[], outputs: TxOutput
   return { arkTx, checkpoints, prevTxids: inputs.map(i => i.coin.txid) };
 }
 
-/** Owner/exit-style spends with no emulator input go straight to arkd: submit, co-sign checkpoints, finalize. */
-export async function submitToArkd(chain: Chain, arkTx: Transaction, checkpoints: Transaction[], signer: SingleKey) {
-  const b64 = (t: Transaction) => Buffer.from(t.toPSBT()).toString('base64');
-  const res = await chain.ark.submitTx(b64(arkTx), checkpoints.map(b64));
-  const matched = matchServerCheckpoints(res.signedCheckpointTxs, checkpoints, 'submitTx');
-  const finals = await Promise.all(matched.map(async ({ server }) => b64(await signer.sign(server, [0]))));
-  await chain.ark.finalizeTx(res.arkTxid, finals);
-  return res.arkTxid;
-}
-
 // ------------------------------------------------------------ fill helper
 
 export interface FillPlan {
@@ -227,33 +216,11 @@ export function makerLeg(p: FillPlan): { input: TxInput; change: TxOutput } {
 /** Smallest `received` satisfying the rate for `sold` (rounded up: maker's favour). */
 export const minReceived = (q: Quote, sold: bigint) => (sold * q.rateNum + q.rateDen - 1n) / q.rateDen;
 
-/** Error-text assertion over the emulator log lines `refused()` returns (other suites log concurrently). */
-export function expectError(lines: string[], text: string | RegExp) {
-  assert.ok(lines.some(l => typeof text === 'string' ? l.includes(text) : text.test(l)),
-    `Expected an emulator error matching ${text}; got:\n${lines.join('\n')}`);
-}
-
 /** Weight of a finalized ark tx returned by the emulator (base64 PSBT). */
 export function finalWeight(signedArkTx: string) {
   const tx = Transaction.fromPSBT(Uint8Array.from(Buffer.from(signedArkTx, 'base64')));
   tx.finalize();
   return { weight: tx.weight, vsize: tx.vsize, txid: tx.id };
-}
-
-/** Every `level=error` line of the emulator log (arkd rejections relayed by the emulator included). */
-export function emulatorErrors() {
-  const logs = spawnSync('docker', ['logs', EMULATOR_CONTAINER], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024 });
-  return (logs.stdout + logs.stderr).split('\n').filter(l => l.includes('level=error'));
-}
-/** `submit` that, on failure, appends the emulator's new error lines to the thrown error. */
-export async function submitExplained(chain: Chain, built: { arkTx: Transaction; checkpoints: Transaction[]; prevTxids: string[] }) {
-  const before = emulatorErrors().length;
-  try { return await submit(chain, built.arkTx, built.checkpoints, built.prevTxids); }
-  catch (e) {
-    await new Promise(r => setTimeout(r, 300));
-    const lines = emulatorErrors().slice(before).map(l => l.replace(/^.*error="/, '')).join('\n');
-    throw new Error(`${(e as Error).message}\nEmulator log since submit:\n${lines}`, { cause: e });
-  }
 }
 
 /** `fundedWallet`, but only tops up the shortfall below `min` sats: test keys are deterministic, so
@@ -265,38 +232,17 @@ export async function ensureFunded(chain: Chain, n: number, min: number): Promis
   return fundedWallet(chain, n, min - have);
 }
 
-/** Every spendable coin at `pkScript` from arkd's indexer. It pages at 100 and `pageIndex` is
- * 1-based (0 and 1 return the same page), so walk 1..total and dedupe by outpoint. */
-export async function allCoinsAt(chain: Chain, tree: { pkScript: Uint8Array }): Promise<VirtualCoin[]> {
-  const out = new Map<string, VirtualCoin>();
-  for (let pageIndex = 1, total = 1; pageIndex <= total; pageIndex++) {
-    const { vtxos, page } = await chain.indexer.getVtxos({ scripts: [Buffer.from(tree.pkScript).toString('hex')], spendableOnly: true, pageIndex, pageSize: 100 });
-    for (const v of vtxos) out.set(`${v.txid}:${v.vout}`, v);
-    total = page?.total ?? 1;
-  }
-  return [...out.values()];
-}
-/** A plain wallet's spendable coins straight from arkd's indexer (the SDK wallet's own view is a
- * polled snapshot that misses spends made around it), carrying the wallet's tap leaves. */
-const leafCache = new WeakMap<TestWallet, Promise<ExtendedVirtualCoin>>();
-export async function walletCoins(chain: Chain, w: TestWallet): Promise<ExtendedVirtualCoin[]> {
-  let first = leafCache.get(w);
-  if (!first) { first = waitFor(async () => (await w.wallet.getVtxos())[0], 'wallet vtxo for tap leaves'); leafCache.set(w, first); }
-  const { tapTree, forfeitTapLeafScript, intentTapLeafScript } = await first;
-  return (await allCoinsAt(chain, w)).map(c => ({ ...c, tapTree, forfeitTapLeafScript, intentTapLeafScript }));
-}
-
 /** Owner-leaf withdrawal of every spendable VTXO at `offer` back to the maker wallet, in chunks.
  * Keeps reruns from stranding sats in offer addresses (the regtest faucet is small). */
 export async function sweepOffer(chain: Chain, offer: Offer, w: TestWallet, chunk = 30) {
-  const coins = await allCoinsAt(chain, offer.tree);
+  const coins = await coinsAt(chain, offer.tree);
   for (let i = 0; i < coins.length; i += chunk) {
     const part = coins.slice(i, i + chunk);
     const assets = new Map<string, bigint>();
     for (const c of part) for (const a of c.assets ?? []) assets.set(a.assetId, (assets.get(a.assetId) ?? 0n) + BigInt(a.amount));
     const built = await buildTx(chain, part.map(c => ownerInput(c, offer.tree, w.identity)),
       [{ script: w.pkScript, amount: part.reduce((s, c) => s + BigInt(c.value), 0n), assets: [...assets].map(([assetId, amount]) => ({ assetId, amount })) }]);
-    await submitToArkd(chain, built.arkTx, built.checkpoints, w.identity);
+    await submitToArkd(chain, built.arkTx, built.checkpoints);
   }
   return coins.length;
 }
@@ -311,18 +257,5 @@ export async function demoUsd(chain: Chain, w: TestWallet, minBalance = 10_000n 
   const totals = new Map<string, bigint>();
   for (const c of await walletCoins(chain, w)) for (const a of c.assets ?? []) totals.set(a.assetId, (totals.get(a.assetId) ?? 0n) + BigInt(a.amount));
   const best = [...totals].sort((a, b) => (b[1] > a[1] ? 1 : -1))[0];
-  return best && best[1] >= minBalance ? best[0] : issueDemoUsd(w);
-}
-
-/** Harness `refused`, but when the rejection is not a covenant refusal the failure names the real
- * error and every emulator error line since the attempt (transport, arkd, build errors). */
-export async function refusedExplained(fn: () => Promise<unknown>) {
-  const before = executionErrors().length, beforeAll = emulatorErrors().length;
-  let error: unknown;
-  await assert.rejects(fn, e => { error = e; return true; });
-  try { await waitFor(async () => executionErrors().length > before ? true : undefined, 'emulator execution error', 5_000); }
-  catch {
-    throw new Error(`Rejected, but not by covenant execution: ${(error as Error)?.message}\nEmulator log since attempt:\n${emulatorErrors().slice(beforeAll).join('\n')}`, { cause: error });
-  }
-  return executionErrors().slice(before);
+  return best && best[1] >= minBalance ? best[0] : issueDemoUsd(chain, w);
 }

@@ -41,7 +41,7 @@ test(`chain depth: ${DEPTH} chained offchain covenant txs without a batch`, { ti
   t.diagnostic(`reached depth ${submitMs.length}; emulator SubmitTx p50 ${percentile(s, 0.5).toFixed(0)} ms, ` +
     `p95 ${percentile(s, 0.95).toFixed(0)} ms, max ${(s.at(-1) ?? NaN).toFixed(0)} ms; indexer prev-tx fetch p50 ${percentile(p, 0.5).toFixed(0)} ms`);
   const [last] = await chain.indexer.getVtxos({ outpoints: [{ txid: coin.txid, vout: 0 }] }).then(r => r.vtxos);
-  t.diagnostic(`tip vtxo: preconfirmed=${last?.virtualStatus?.state} spent=${last?.isSpent}`);
+  t.diagnostic(`tip vtxo: preconfirmed=${last?.isPreconfirmed} spent=${last?.isSpent}`);
   assert.equal(failure, undefined);
   assert.equal(submitMs.length, DEPTH);
 });

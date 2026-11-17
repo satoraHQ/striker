@@ -22,9 +22,7 @@ import {
 } from '@arkade-os/sdk';
 import { RawWitness, ScriptNum } from '@scure/btc-signer';
 import { sha256 } from '@noble/hashes/sha2.js';
-import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { b64, covenantLeaf, EMULATOR_CONTAINER, exitLeaf, hex, submit, unb64, waitFor, type Chain, type TestWallet } from './harness.js';
+import { covenantLeaf, exitLeaf, hex, submit, submitToArkd, waitFor, walletCoins, type Chain, type TestWallet } from './harness.js';
 
 type Ops = Parameters<typeof arkade.ArkadeScript.encode>[0];
 export const BTC = 'BTC' as const;
@@ -249,17 +247,10 @@ export async function submitViaEmulator(chain: Chain, spends: Spend[], outs: Out
   return (await submit(chain, arkTx, checkpoints, prevTxids)).txid;
 }
 
-/** Plain arkd path (no covenant inputs): submit, co-sign the checkpoints, finalize. */
+/** Plain arkd path (no covenant inputs): the checkpoints are signed by `buildTx`, arkd finalizes on submit. */
 export async function submitViaArkd(chain: Chain, spends: Spend[], outs: Out[]) {
   const { arkTx, checkpoints } = await buildTx(chain, spends, outs);
-  const res = await chain.ark.submitTx(b64(arkTx.toPSBT()), checkpoints.map(c => b64(c.toPSBT())));
-  const final = await Promise.all(res.signedCheckpointTxs.map(async (cp, i) => {
-    const signer = spends[i]?.signer;
-    const tx = Transaction.fromPSBT(unb64(cp));
-    return b64((signer ? await signer.sign(tx, [0]) : tx).toPSBT());
-  }));
-  await chain.ark.finalizeTx(res.arkTxid, final);
-  return res.arkTxid;
+  return (await submitToArkd(chain, arkTx, checkpoints)).txid;
 }
 
 // ---------------------------------------------------------------- fill planning
@@ -302,19 +293,6 @@ const add = (a: Record<string, bigint>, b: Record<string, bigint> = {}, sign = 1
   for (const [k, v] of Object.entries(b)) r[k] = (r[k] ?? 0n) + sign * v;
   return r;
 };
-
-/** Spendable VTXOs of a wallet, re-read from the indexer (wallet state lags custom txs). */
-const templates = new WeakMap<TestWallet, ExtendedVirtualCoin>();
-export async function walletCoins(chain: Chain, w: TestWallet): Promise<ExtendedVirtualCoin[]> {
-  if (!templates.has(w)) {
-    const tpl = (await w.wallet.getVtxos()).find(v => v.script === hex(w.pkScript));
-    if (!tpl) throw new Error('Wallet has no coin to learn its tapscripts from');
-    templates.set(w, tpl);
-  }
-  const tpl = templates.get(w)!;
-  const { vtxos } = await chain.indexer.getVtxos({ scripts: [hex(w.pkScript)], spendableOnly: true });
-  return vtxos.map(v => ({ ...v, tapTree: tpl.tapTree, forfeitTapLeafScript: tpl.forfeitTapLeafScript, intentTapLeafScript: tpl.intentTapLeafScript }));
-}
 
 export interface Order { swap: Swap; coin: CoinLike; plan: FillPlan; declared?: Record<string, bigint> }
 
@@ -379,22 +357,4 @@ export async function deposit(chain: Chain, from: TestWallet, swap: Swap, sats: 
 /** The VTXO at `txid:vout`, with its value and assets as the indexer sees it. */
 export async function outputAt(chain: Chain, txid: string, vout: number) {
   return waitFor(async () => (await chain.indexer.getVtxos({ outpoints: [{ txid, vout }] })).vtxos[0], `output ${txid}:${vout}`);
-}
-
-/** Every emulator "failed to process transaction" line (script failures *and* arkd
- * rejections relayed by the emulator, e.g. ASSET_INPUT_INVALID). Belongs in the harness. */
-export function emulatorFailures() {
-  const logs = spawnSync('docker', ['logs', EMULATOR_CONTAINER], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024 });
-  assert.equal(logs.status, 0, 'Cannot read emulator logs');
-  return (logs.stdout + logs.stderr).split('\n').filter(l => l.includes('failed to process transaction'));
-}
-/** Asserts `fn` is rejected and a new emulator failure line contains `text`. */
-export async function rejectedWith(text: string, fn: () => Promise<unknown>) {
-  const before = emulatorFailures().length;
-  await assert.rejects(fn);
-  const lines = await waitFor(async () => {
-    const l = emulatorFailures().slice(before);
-    return l.some(x => x.includes(text)) ? l : undefined;
-  }, `emulator failure containing "${text}"`, 5_000);
-  return lines.filter(x => x.includes(text));
 }

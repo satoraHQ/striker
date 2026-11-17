@@ -11,7 +11,7 @@ test('harness: covenant with sats + demo USD settles through the emulator', { ti
   t.after(disposeWallets);
   const chain = await connect();
   const alice = await fundedWallet(chain, 10);
-  const usd = await issueDemoUsd(alice);
+  const usd = await issueDemoUsd(chain, alice);
 
   // Covenant: output 0 must have value >= 1000 sats. Nothing else.
   const script = arkade.ArkadeScript.encode([0, 'INSPECTOUTPUTVALUE', 1000, 'GREATERTHANOREQUAL']);
@@ -33,7 +33,8 @@ test('harness: covenant with sats + demo USD settles through the emulator', { ti
   };
 
   const bad = build(500n);
-  await refused(() => submit(chain, bad.arkTx, bad.checkpoints, [coin.txid]));
+  const r = await refused(() => submit(chain, bad.arkTx, bad.checkpoints, [coin.txid]), /opcode=OP_GREATERTHANOREQUAL .*false stack entry/);
+  t.diagnostic(`covenant refusal (grpc code ${r.code}): ${r.message}`);
   const good = build(5_000n);
   const { txid: spent } = await submit(chain, good.arkTx, good.checkpoints, [coin.txid]);
   assert.match(spent, /^[0-9a-f]{64}$/);

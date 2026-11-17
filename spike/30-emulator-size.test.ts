@@ -6,8 +6,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { attachPrevArkTxs, Transaction, type VtxoScript } from '@arkade-os/sdk';
-import { addressOf, b64, coinAt, connect, covenantTree, disposeWallets, exitLeaf, fundedWallet, unb64, type Chain } from './harness.js';
-import { beforeExpiryOffchainOnly, emulatorLog, spend, trivial } from './emulator-behaviour.js';
+import { addressOf, b64, coinAt, connect, covenantTree, disposeWallets, exitLeaf, fundedWallet, rejectionOf, unb64, type Chain } from './harness.js';
+import { beforeExpiryOffchainOnly, spend, trivial } from './emulator-behaviour.js';
 
 type Coin = { txid: string; vout: number; value: number };
 function finalWeight(signedArkTx: string) {
@@ -23,15 +23,16 @@ async function attempt(chain: Chain, inputs: { coin: Coin; tree: VtxoScript; scr
   return { ms: performance.now() - t0, txid: Transaction.fromPSBT(unb64(res.signedArkTx)).id, weight: finalWeight(res.signedArkTx) };
 }
 async function largest(from: number, run: (n: number) => ReturnType<typeof attempt>) {
-  const logStart = emulatorLog().length;
+  const reasons = new Set<string>();
   for (let n = from; n > 0; n--) {
     try {
       const ok = await run(n);
-      // Other suites share the emulator; keep only the refusal kinds this search can cause.
-      const reasons = new Set(emulatorLog().slice(logStart).flatMap(l =>
-        /TX_TOO_LARGE \(46\): ark tx weight is too high|exceeded (request )?execution limit of \d+/.exec(l)?.[0] ?? []));
       return { n, ...ok, reasons: [...reasons].join('; ') };
-    } catch { /* refused: try one smaller */ }
+    } catch (e) {
+      // Refused: record why (arkd's weight limit relayed by the emulator, or the emulator's compute budget) and try one smaller.
+      const { message } = rejectionOf(e);
+      reasons.add(/TX_TOO_LARGE \(46\): ark tx weight is too high|exceeded (request )?execution limit of \d+/.exec(message)?.[0] ?? message.slice(0, 160));
+    }
   }
   throw new Error('nothing fits');
 }

@@ -1,25 +1,22 @@
 // DESIGN.md §13 item 9 (Renew leaf) and item 11 (L1 exit). Keys 80–99.
 //
-// Fee note: on this regtest stack arkd's intent fee program is
-// `offchainInput: amount * 0.01` (no expiry waiver), so an exact-value OP_TUNNEL
-// renewal cannot register. The suite therefore (a) proves the exact-value leaf
-// on the emulator and records arkd's fee rejection, running the real batch only
-// when the fee program evaluates to 0, and (b) settles a fee-capped variant
-// through a real batch. To re-run (a) end to end, start the stack with the
-// Mutinynet-style program, e.g. in .env.regtest:
-//   ARK_OFFCHAIN_INPUT_FEE="inputType == 'vtxo' && expiry - now() > 518656.0 ? amount * 0.002 : 0.0"
-// (applied by the regtest CLI via POST /v1/admin/intentFees; see spike/README.md).
+// Fee note: `.env.regtest` mirrors Mutinynet's intent fee program,
+// `inputType == 'vtxo' && expiry - now() > 518656.0 ? amount * 0.002 : 0.0`, so an input
+// within ~6 days of expiry (every VTXO on this 86 400 s regtest) is free and the exact-value
+// OP_TUNNEL renewal settles through a real batch. The suite reads the program from `/v1/info`
+// and, should it charge again (e.g. the stock `amount * 0.01`), records arkd's fee rejection
+// instead. The fee-capped variant always pays a fee through the batch to exercise the cap.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ArkError, EsploraProvider, Extension, EmulatorPacket, Intent, OnchainWallet, SingleKey, arkade, asset, buildOffchainTx } from '@arkade-os/sdk';
+import { ArkError, EsploraProvider, Extension, EmulatorPacket, OnchainWallet, Proof, SingleKey, arkade, asset, buildOffchainTx, networks } from '@arkade-os/sdk';
 import { RawWitness, ScriptNum } from '@scure/btc-signer';
 import { ESPLORA_URL, addressOf, asInput, coinAt, connect, covenantTree, disposeWallets, exitLeaf, fundedWallet, hex, issueDemoUsd,
   refused, regtest, secret, submit, waitFor } from './harness.js';
-import { RENEW_LEAF, advanceMedianTime, approveRenewal, delegate, ensureEventSource, exitSpend, expectedIntentFee, preservedOutput,
+import { RENEW_LEAF, advanceMedianTime, approveRenewal, delegate, exitSpend, expectedIntentFee, preservedOutput,
   renewThroughBatch, renewableCovenant, renewalIntent, renewedCoin, unrollToL1, type RenewalOutput } from './renew.js';
 
-ensureEventSource();
 const WEEK = 7n * 86_400n;
+const network = networks.regtest;
 const esplora = () => new EsploraProvider(ESPLORA_URL, { forcePolling: true, pollingInterval: 2000 });
 // Placeholder for the fill rule: output 0 must carry at least 1000 sats.
 const FILL = arkade.ArkadeScript.encode([0, 'INSPECTOUTPUTVALUE', 1000, 'GREATERTHANOREQUAL']);
@@ -29,10 +26,9 @@ test('renew leaf (§13 item 9): Striker renews a covenant VTXO through a batch; 
   t.after(disposeWallets);
   const chain = await connect();
   const owner = await fundedWallet(chain, 80, 300_000);
-  const usd = await issueDemoUsd(owner);
-  // Striker: a separate key with no funds and no leaf in the covenant.
-  const striker = await delegate(SingleKey.fromPrivateKey(secret(81)));
-  const network = (await OnchainWallet.create(striker.identity, 'regtest', esplora())).network;
+  const usd = await issueDemoUsd(chain, owner);
+  // Striker: a separate tree-signer key with no funds and no leaf in the covenant.
+  const striker = await delegate(secret(81));
   const fund = async (covenant: ReturnType<typeof renewableCovenant>, sats: number, usdAmount?: bigint) => {
     const txid = await owner.wallet.send({ address: addressOf(chain, covenant.tree), amount: sats,
       assets: usdAmount ? [{ assetId: usd, amount: usdAmount }] : undefined });
@@ -71,8 +67,8 @@ test('renew leaf (§13 item 9): Striker renews a covenant VTXO through a batch; 
       ['assets - 1', { ...good, assets: [{ assetId: usd, amount: 41n }] }],
     ];
     for (const [label, output] of mutations) {
-      const errors = await refused(async () => approveRenewal(chain, await renewalIntent(chain, exact, exactCoin, striker.cosigner, output)));
-      t.diagnostic(`${label}: ${errors.at(-1)?.replace(/^.*error=/, '')}`);
+      const r = await refused(async () => approveRenewal(chain, await renewalIntent(chain, exact, exactCoin, striker.cosigner, output)), /OP_TUNNEL/);
+      t.diagnostic(`${label}: ${r.message}`);
     }
     // OP_TUNNEL's asset flag compares packet-local amounts only: a proof with
     // no asset packet at all passes the covenant. arkd refuses it instead
@@ -80,31 +76,31 @@ test('renew leaf (§13 item 9): Striker renews a covenant VTXO through a batch; 
     await approveRenewal(chain, await renewalIntent(chain, exact, exactCoin, striker.cosigner, { ...good, assets: [] }));
     t.diagnostic('assets dropped (no asset packet): approved by the emulator; conservation is enforced by arkd, not OP_TUNNEL');
     // Wrong cosigner, and a second cosigner, are refused by the intent-message gate.
-    const other = await delegate(SingleKey.fromPrivateKey(secret(82)));
-    await refused(async () => approveRenewal(chain, await renewalIntent(chain, exact, exactCoin, other.cosigner, good)));
+    const other = await delegate(secret(82));
+    await refused(async () => approveRenewal(chain, await renewalIntent(chain, exact, exactCoin, other.cosigner, good)), /OP_EQUALVERIFY failed/);
     await refused(async () => {
       const intent = await renewalIntent(chain, exact, exactCoin, striker.cosigner, good);
       intent.message.cosigners_public_keys.push(other.cosigner);
       const outputs = Array.from({ length: intent.proof.outputsLength }, (_, i) => {
         const o = intent.proof.getOutput(i); return { script: o.script!, amount: o.amount! }; });
-      intent.proof = Intent.create(intent.message, [intent.input], outputs);
+      intent.proof = Proof.create(intent.message, [intent.input], outputs);
       return approveRenewal(chain, intent);
-    });
+    }, /OP_VERIFY failed/);
   });
 
   await t.test('off-chain (non-batch) spend through the renew leaf is refused', async () => {
     const assets = asset.Packet.create([asset.AssetGroup.create(asset.AssetId.fromString(usd), null, [asset.AssetInput.create(0, 42n)], [asset.AssetOutput.create(0, 42n)], [])]);
     const emu = EmulatorPacket.create([{ vin: 0, script: exact.renew, witness: RawWitness.encode([]) }]);
     const tx = buildOffchainTx([asInput(exactCoin, exact.tree, RENEW_LEAF)], [{ script: exact.tree.pkScript, amount: 20_000n }, Extension.create([assets, emu]).txOut()], chain.checkpoint);
-    const errors = await refused(() => submit(chain, tx.arkTx, tx.checkpoints, [exactCoin.txid]));
-    t.diagnostic(`offchain misuse: ${errors.at(-1)?.replace(/^.*error=/, '')}`);
+    const r = await refused(() => submit(chain, tx.arkTx, tx.checkpoints, [exactCoin.txid]), /OP_VERIFY failed/);   // the `type` gate
+    t.diagnostic(`offchain misuse: ${r.message}`);
   });
 
   await t.test('renewal before the window opens is refused (OP_PUSHEXPIRY time gate)', async () => {
     const early = renewableCovenant(chain, owner.publicKey, FILL, { cosigner: striker.cosigner, window: 1024n });
     const coin = await fund(early, 5_000);
     assert.ok(expiryOf(coin) - 1024n > BigInt(Math.floor(Date.now() / 1000)), 'window has not opened');
-    await refused(async () => approveRenewal(chain, await renewalIntent(chain, early, coin, striker.cosigner, preservedOutput(early.tree, coin))));
+    await refused(async () => approveRenewal(chain, await renewalIntent(chain, early, coin, striker.cosigner, preservedOutput(early.tree, coin))), /OP_VERIFY failed/);
   });
 
   await t.test('exact-value renewal: arkd fee program decides', async () => {
@@ -122,10 +118,12 @@ test('renew leaf (§13 item 9): Striker renews a covenant VTXO through a batch; 
         t.diagnostic(`arkd rejection: ${e.name}: ${e.message}`);
         return true;
       });
-      t.diagnostic('exact-value batch renewal skipped: arkd charges a fee on this stack (see header for the fee-free re-run)');
+      t.diagnostic('exact-value batch renewal skipped: arkd charges a fee on this stack (see the header)');
       return;
     }
+    const started = Date.now();
     const commitment = await renewThroughBatch(chain, striker, intent, approved, network);
+    t.diagnostic(`exact-value renewal settled fee-free in batch ${commitment} after ${Math.round((Date.now() - started) / 1000)} s`);
     const renewed = await renewedCoin(chain, exact.tree, exactCoin, commitment);
     assert.equal(renewed.value, exactCoin.value);
     assert.equal(renewed.script, hex(exact.tree.pkScript));
@@ -138,10 +136,13 @@ test('renew leaf (§13 item 9): Striker renews a covenant VTXO through a batch; 
     // Allow arkd's fee to be taken from the VTXO, bounded by the covenant.
     const capped = renewableCovenant(chain, owner.publicKey, FILL, { cosigner: striker.cosigner, window: WEEK, maxFee: 250n });
     const coin = await fund(capped, 20_000, 42n);
-    const fee = expectedIntentFee(chain, coin, preservedOutput(capped.tree, coin));
-    assert.ok(fee <= 250n, `fee ${fee} exceeds the covenant cap; adjust maxFee for this fee program`);
+    const required = expectedIntentFee(chain, coin, preservedOutput(capped.tree, coin));
+    assert.ok(required <= 250n, `fee ${required} exceeds the covenant cap; adjust maxFee for this fee program`);
+    // Pay at least 200 sats so the batch really deducts a fee under the cap even when arkd asks for 0.
+    const fee = required > 200n ? required : 200n;
     // Deducting more than the cap is refused.
-    await refused(async () => approveRenewal(chain, await renewalIntent(chain, capped, coin, striker.cosigner, preservedOutput(capped.tree, coin, 251n))));
+    await refused(async () => approveRenewal(chain, await renewalIntent(chain, capped, coin, striker.cosigner, preservedOutput(capped.tree, coin, 251n))),
+      /opcode=OP_GREATERTHANOREQUAL .*false stack entry/);
     // Dropping the asset packet passes the covenant but not arkd.
     const burning = await renewalIntent(chain, capped, coin, striker.cosigner, { ...preservedOutput(capped.tree, coin, fee), assets: [] });
     const burningProof = await approveRenewal(chain, burning);
@@ -154,7 +155,7 @@ test('renew leaf (§13 item 9): Striker renews a covenant VTXO through a batch; 
     const approved = await approveRenewal(chain, intent);
     const started = Date.now();
     const commitment = await renewThroughBatch(chain, striker, intent, approved, network);
-    t.diagnostic(`batch ${commitment} settled in ${Math.round((Date.now() - started) / 1000)} s, fee ${fee} sats`);
+    t.diagnostic(`batch ${commitment} settled in ${Math.round((Date.now() - started) / 1000)} s, fee paid ${fee} sats (arkd required ${required})`);
     const renewed = await renewedCoin(chain, capped.tree, coin, commitment);
     assert.equal(BigInt(renewed.value), BigInt(coin.value) - fee);
     assert.equal(renewed.script, hex(capped.tree.pkScript));
@@ -178,8 +179,8 @@ test('L1 exit (§13 item 11): unroll a covenant VTXO and spend the exit leaf wit
   const depthBefore = (await chain.indexer.getVtxoChain({ txid: (await owner.wallet.getVtxos())[0]!.txid, vout: (await owner.wallet.getVtxos())[0]!.vout })).chain.length;
   await owner.wallet.settle();
   await waitFor(async () => (await owner.wallet.getVtxos()).every(v => !v.isPreconfirmed) ? true : undefined, 'owner settlement');
-  const usd = await issueDemoUsd(owner);
-  const striker = await delegate(SingleKey.fromPrivateKey(secret(92)));
+  const usd = await issueDemoUsd(chain, owner);
+  const striker = await delegate(secret(92));
   const covenant = renewableCovenant(chain, owner.publicKey, FILL, { cosigner: striker.cosigner, window: WEEK, maxFee: 250n }, 1536n);
   const txid = await owner.wallet.send({ address: addressOf(chain, covenant.tree), amount: 30_000, assets: [{ assetId: usd, amount: 7n }] });
   const coin = await coinAt(chain, covenant.tree, txid);

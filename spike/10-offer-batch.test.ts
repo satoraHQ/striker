@@ -2,9 +2,9 @@
 // attack, and the practical input/output limit against arkd's maxTxWeight. Keys 30–39.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { coinAt, coinsAt, connect, disposeWallets, refused, secret, waitFor } from './harness.js';
-import { BTC, allCoinsAt, assetBytes, assetIdsOf, buildTx, demoUsd, ensureFunded, sweepOffer, expectError, finalWeight, makerLeg, minReceived, offerTree, signQuote, submitExplained,
-  usdOf, walletCoins, walletInput, type Coin, type FillPlan, type Offer, type Quote, type TxInput, type TxOutput } from './offer.js';
+import { coinAt, coinsAt, connect, disposeWallets, refused, rejectionOf, secret, submitBuilt, waitFor, walletCoins } from './harness.js';
+import { BTC, assetBytes, assetIdsOf, buildTx, demoUsd, ensureFunded, sweepOffer, finalWeight, makerLeg, minReceived, offerTree, signQuote,
+  usdOf, walletInput, type Coin, type FillPlan, type Offer, type Quote, type TxInput, type TxOutput } from './offer.js';
 import type { ExtendedVirtualCoin } from '@arkade-os/sdk';
 
 const USD = 100_000_000n;
@@ -17,7 +17,7 @@ const sellUsd = (o: Offer, over: Partial<Quote> = {}): Quote => ({ maker: o.make
 test('offer covenant: batching, index pairing, size limit', { timeout: 900_000 }, async t => {
   t.after(disposeWallets);
   const chain = await connect();
-  const makerA = await ensureFunded(chain, 30, 0);
+  const makerA = await ensureFunded(chain, 30, 900_000);     // funds the USD issuance/sends below; topped up again after the sweep
   const makerB = await ensureFunded(chain, 31, 0);
   const taker1 = await ensureFunded(chain, 32, 500_000);
   const taker2 = await ensureFunded(chain, 33, 600_000);
@@ -59,7 +59,7 @@ test('offer covenant: batching, index pairing, size limit', { timeout: 900_000 }
     const la = makerLeg(pa), lb = makerLeg(pb);
     const built = await buildTx(chain, [la.input, lb.input, walletInput(t1, taker1.identity), walletInput(t2!, taker2.identity)],
       [la.change, lb.change, takerOut(taker1, t1, pa), takerOut(taker2, t2!, pb)]);
-    const { txid, result } = await submitExplained(chain, built);
+    const { txid, result } = await submitBuilt(chain, built);
     console.log(`  2 makers + 2 takers: weight=${finalWeight(result.signedArkTx).weight}`);
     const [na, nb] = [await coinAt(chain, A.tree, txid), await coinAt(chain, B.tree, txid)];
     assert.equal(na.value, 80_000); assert.equal(usdOf(na, usd), 100n * USD + 20_000n * 100_000n);
@@ -77,21 +77,21 @@ test('offer covenant: batching, index pairing, size limit', { timeout: 900_000 }
     const change = makerLeg(p1).change;
     const stolen = { sats: 10_000n + 100_000n, usd: 100n * USD - p1.received };
     // (a) Output 1 is the taker's loot: input 1's balance arithmetic fails against it.
-    let lines = await refused(async () => submitExplained(chain, await buildTx(chain,
+    await refused(async () => submitBuilt(chain, await buildTx(chain,
       [makerLeg(p1).input, makerLeg(p2).input, walletInput(tc, taker1.identity)],
-      [change, { script: taker1.pkScript, amount: BigInt(tc.value) + stolen.sats, assets: [{ assetId: usd, amount: usdOf(tc, usd) + stolen.usd }] }])));
-    expectError(lines, /OP_VERIFY failed vin=1/);
+      [change, { script: taker1.pkScript, amount: BigInt(tc.value) + stolen.sats, assets: [{ assetId: usd, amount: usdOf(tc, usd) + stolen.usd }] }])),
+      /input 1: .*OP_VERIFY failed/);
     // (b) Output 1 is a decoy with exactly a valid change's balances but the taker's script: only
     //     the script check stands between the maker and the loss.
     const decoy: TxOutput = { ...change, script: taker1.pkScript };
-    lines = await refused(async () => submitExplained(chain, await buildTx(chain,
+    await refused(async () => submitBuilt(chain, await buildTx(chain,
       [makerLeg(p1).input, makerLeg(p2).input, walletInput(tc, taker1.identity)],
-      [change, decoy, { script: taker1.pkScript, amount: BigInt(tc.value) + 20_000n, assets: [{ assetId: usd, amount: usdOf(tc, usd) - 2n * p1.received }] }])));
-    expectError(lines, /does not preserve source script.*vin=1/);
+      [change, decoy, { script: taker1.pkScript, amount: BigInt(tc.value) + 20_000n, assets: [{ assetId: usd, amount: usdOf(tc, usd) - 2n * p1.received }] }])),
+      /input 1: .*does not preserve source script/);
     // The honest version: each maker's change at its own index.
     const l1 = makerLeg(p1), l2 = makerLeg(p2);
     const honest: TxOutput = { script: taker1.pkScript, amount: BigInt(tc.value) + 20_000n, assets: [{ assetId: usd, amount: usdOf(tc, usd) - p1.received - p2.received }] };
-    const { txid } = await submitExplained(chain, await buildTx(chain, [l1.input, l2.input, walletInput(tc, taker1.identity)], [l1.change, l2.change, honest]));
+    const { txid } = await submitBuilt(chain, await buildTx(chain, [l1.input, l2.input, walletInput(tc, taker1.identity)], [l1.change, l2.change, honest]));
     await waitFor(async () => (await coinsAt(chain, A.tree)).filter(c => c.txid === txid).length === 2 ? true : undefined, 'two maker changes');
   });
 
@@ -103,11 +103,11 @@ test('offer covenant: batching, index pairing, size limit', { timeout: 900_000 }
       let accepted = { n: 0, weight: 0 };
       for (let n = from; ; n++) {
         try {
-          const { result } = await submitExplained(chain, await build(n));
+          const { result } = await submitBuilt(chain, await build(n));
           accepted = { n, weight: finalWeight(result.signedArkTx).weight };
           console.log(`  ${label}: n=${n} accepted at ${accepted.weight} WU`);
         } catch (e) {
-          assert.match((e as Error).message, tooLarge, `expected TX_TOO_LARGE at n=${n}`);
+          assert.match(rejectionOf(e).message, tooLarge, `expected TX_TOO_LARGE at n=${n}`);
           console.log(`  ${label}: n=${n} refused by arkd (TX_TOO_LARGE); max=${max}`);
           return { accepted, refused: n };
         }
@@ -129,8 +129,8 @@ test('offer covenant: batching, index pairing, size limit', { timeout: 900_000 }
       const ins: TxInput[] = [leg.input, ...coins.map(c => walletInput(c, taker2.identity))];
       return buildTx(chain, ins, outs);
     };
-    const w1 = finalWeight((await submitExplained(chain, await perTaker(1))).result.signedArkTx).weight;
-    const w2 = finalWeight((await submitExplained(chain, await perTaker(2))).result.signedArkTx).weight;
+    const w1 = finalWeight((await submitBuilt(chain, await perTaker(1))).result.signedArkTx).weight;
+    const w2 = finalWeight((await submitBuilt(chain, await perTaker(2))).result.signedArkTx).weight;
     const takerWu = w2 - w1;
     console.log(`  1 maker + 1 taker: ${w1} WU; per extra taker: ${takerWu} WU`);
     const takers = await probe('takers', Math.floor((max - (w1 - takerWu)) / takerWu), perTaker);
@@ -138,7 +138,7 @@ test('offer covenant: batching, index pairing, size limit', { timeout: 900_000 }
 
     // --- N makers (identical offer, one 10 000-sat VTXO each, all selling BTC) against one taker paying USD.
     const makerCoins = async (n: number) => {
-      const mine = async () => (await allCoinsAt(chain, A.tree)).filter(c => c.value === 10_000 && usdOf(c, usd) === 0n);
+      const mine = async () => (await coinsAt(chain, A.tree)).filter(c => c.value === 10_000 && usdOf(c, usd) === 0n);
       for (let have = (await mine()).length; have < n; have++) await fund(makerA, A, 10_000, 0n);
       return (await mine()).slice(0, n);
     };
@@ -152,8 +152,8 @@ test('offer covenant: batching, index pairing, size limit', { timeout: 900_000 }
       const out: TxOutput = { script: taker1.pkScript, amount: BigInt(tc.value) + 1_000n * BigInt(n), assets: [{ assetId: usd, amount: usdOf(tc, usd) - paid }] };
       return buildTx(chain, [...legs.map(l => l.input), walletInput(tc, taker1.identity)], [...legs.map(l => l.change), out]);
     };
-    const m1 = finalWeight((await submitExplained(chain, await perMaker(1))).result.signedArkTx).weight;
-    const m2 = finalWeight((await submitExplained(chain, await perMaker(2))).result.signedArkTx).weight;
+    const m1 = finalWeight((await submitBuilt(chain, await perMaker(1))).result.signedArkTx).weight;
+    const m2 = finalWeight((await submitBuilt(chain, await perMaker(2))).result.signedArkTx).weight;
     const makerWu = m2 - m1;
     console.log(`  1 maker + 1 taker: ${m1} WU; per extra maker: ${makerWu} WU (fill script ${A.script.length} B, witness ${64 + 148} B)`);
     const makers = await probe('makers', Math.floor((max - (m1 - makerWu)) / makerWu), perMaker);

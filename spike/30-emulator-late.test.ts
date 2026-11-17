@@ -47,7 +47,7 @@ test('late submission: CHECKTIME expiry vs held emulator signatures', { timeout:
   // Before expiry: the emulator signs a batch intent and hands it back.
   const session = alice.identity.signerSession();
   const cosigner = hex(await session.getPublicKey());
-  const intentOutputs = [{ script: alice.pkScript, amount: 9_800n }]; // regtest intent fee: 1 % of offchain inputs
+  const intentOutputs = [{ script: alice.pkScript, amount: 9_800n }]; // intent fee = Σin − Σout; 200 sats covers any regtest program
   const heldIntent = await emulatorSignedIntent(chain, intentCoin, tree, script, intentOutputs, registerMessage(cosigner));
   assert.equal(Transaction.fromPSBT(unb64(heldIntent.proof)).getInput(1).tapScriptSig?.length, 1, 'emulator signed the proof');
 
@@ -67,12 +67,12 @@ test('late submission: CHECKTIME expiry vs held emulator signatures', { timeout:
   await refused(() => emulatorSignedIntent(chain, lateIntentCoin, tree, script, intentOutputs, registerMessage(cosigner)));
 
   // After expiry: the held non-finalizer signatures are accepted by arkd.
-  const lateTxid = await submitHeldToArkd(chain, heldSigs, late3.checkpoints, bob.identity);
+  const lateTxid = await submitHeldToArkd(chain, heldSigs, bob.identity);
   t.diagnostic(`late offchain tx accepted by arkd ${now() - expiry} s after expiry: ${lateTxid}`);
   await waitFor(async () => (await unspent(chain, held3, heldCoin)) ? undefined : true, 'held coin spent');
 
   // After expiry: the held intent registers and settles in a batch.
-  const commitment = await settleIntent(chain, heldIntent, intentCoin, tree, script, alice.identity, session,
+  const commitment = await settleIntent(chain, heldIntent, intentCoin, tree, script, session,
     [{ address: alice.address, amount: 9_800 }]);
   t.diagnostic(`late intent settled ${now() - expiry} s after expiry in commitment ${commitment}`);
   assert.ok(!(await unspent(chain, tree, intentCoin)), 'expired covenant coin was spent by the held intent');

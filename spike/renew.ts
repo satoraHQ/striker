@@ -13,55 +13,14 @@
 // intent proof, because input 0 is the BIP322 message input) to the input's
 // script, value and assets. The time gate uses OP_PUSHEXPIRY so renewal opens
 // only `window` seconds before the VTXO expires.
-import { EsploraProvider, EmulatorPacket, Estimator, Extension, Intent, OnchainWallet, Transaction,
-  Unroll, VtxoScript, arkade, asset, configureEventSource, getConfiguredEventSource, resolvePrevTxs, timelockToSequence, Batch,
-  type EventSourceLike, type Identity, type Network, type SignerSession, type VirtualCoin, type IndexerProvider } from '@arkade-os/sdk';
+import { EsploraProvider, EmulatorPacket, Estimator, Extension, OnchainWallet, Proof, Transaction, TreeSignerSession,
+  Unroll, VtxoScript, arkade, asset, resolvePrevTxs, timelockToSequence, Batch,
+  type Network, type SignerSession, type VirtualCoin, type IndexerProvider } from '@arkade-os/sdk';
 import { RawTx, RawWitness, SigHash } from '@scure/btc-signer';
 import { b64, covenantLeaf, covenantTree, exitLeaf, hex, ownerLeaf, regtest, unhex, waitFor, type Chain } from './harness.js';
 
 export const utf8 = (s: string) => new TextEncoder().encode(s);
 
-/**
- * Node has no global `EventSource` (only behind --experimental-eventsource), and
- * the SDK's batch event stream needs one. A minimal fetch-based SSE client
- * covering what `RestArkProvider.getEventStream` uses: `message`/`error`
- * listeners and `close()`.
- */
-class FetchEventSource implements EventSourceLike {
-  private readonly listeners = { message: new Set<(e: MessageEvent) => void>(), error: new Set<(e: MessageEvent) => void>() };
-  private readonly abort = new AbortController();
-  constructor(url: string) { void this.run(url); }
-  private async run(url: string) {
-    try {
-      const response = await fetch(url, { headers: { accept: 'text/event-stream' }, signal: this.abort.signal });
-      if (!response.ok || !response.body) throw new Error(`SSE ${response.status} ${response.statusText}`);
-      const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
-      let buffer = '';
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += value.replace(/\r\n/g, '\n');
-        let end;
-        while ((end = buffer.indexOf('\n\n')) >= 0) {
-          const data = buffer.slice(0, end).split('\n').filter(l => l.startsWith('data:')).map(l => l.slice(5).trimStart()).join('\n');
-          buffer = buffer.slice(end + 2);
-          if (data) for (const listener of this.listeners.message) listener(new MessageEvent('message', { data }));
-        }
-      }
-      throw new Error('SSE stream ended');
-    } catch (error) {
-      if (this.abort.signal.aborted) return;
-      for (const listener of this.listeners.error) listener(new MessageEvent('error', { data: String(error) }));
-    }
-  }
-  addEventListener(type: 'message' | 'error', listener: (event: MessageEvent) => void) { this.listeners[type].add(listener); }
-  removeEventListener(type: 'message' | 'error', listener: (event: MessageEvent) => void) { this.listeners[type].delete(listener); }
-  close() { this.abort.abort(); }
-}
-/** Registers the SSE shim with the SDK once; harmless if a real EventSource is configured. */
-export function ensureEventSource() {
-  if (!getConfiguredEventSource() && typeof globalThis.EventSource === 'undefined') configureEventSource(url => new FetchEventSource(url));
-}
 export const RENEW_LEAF = 1, OWNER_LEAF = 2, EXIT_LEAF = 3;
 /** OP_TUNNEL flag bits (emulator README): 1 scriptPubKey, 2 value, 4 assets. */
 const TUNNEL_SCRIPT = 1, TUNNEL_VALUE = 2, TUNNEL_ASSETS = 4;
@@ -114,7 +73,7 @@ export function preservedOutput(tree: VtxoScript, coin: VirtualCoin, fee = 0n): 
 
 export interface RenewalIntent {
   proof: Transaction;
-  message: Intent.RegisterMessage;
+  message: Proof.RegisterMessage;
   input: arkade.ArkadeExtendedVirtualCoin;
 }
 /**
@@ -126,16 +85,16 @@ export async function renewalIntent(chain: Chain, covenant: RenewableCovenant, c
   const prevTx = (await resolvePrevTxs([coin.txid], chain.indexer)).get(coin.txid);
   if (!prevTx) throw new Error('Missing funding ark tx');
   const leaf = covenant.tree.leaves[RENEW_LEAF]!;
-  const input: arkade.ArkadeExtendedVirtualCoin = { ...coin, tapTree: covenant.tree.encode(), forfeitTapLeafScript: leaf, intentTapLeafScript: leaf,
-    prevTx, arkadeScriptBytes: covenant.renew } as arkade.ArkadeExtendedVirtualCoin;
-  const message: Intent.RegisterMessage = { type: 'register', onchain_output_indexes: [], valid_at: 0, expire_at: 0, cosigners_public_keys: [cosigner] };
+  const input: arkade.ArkadeExtendedVirtualCoin & { prevTx: Uint8Array } = { ...coin, tapTree: covenant.tree.encode(), forfeitTapLeafScript: leaf,
+    proofTapLeafScript: leaf, prevTx, arkadeScriptBytes: covenant.renew };
+  const message: Proof.RegisterMessage = { type: 'register', onchain_output_indexes: [], valid_at: 0, expire_at: 0, cosigners_public_keys: [cosigner] };
   // Asset packet indexes refer to proof inputs (1 = the VTXO) and proof outputs (0).
   const packets = [
     ...(output.assets.length ? [asset.Packet.create(output.assets.map(a => asset.AssetGroup.create(asset.AssetId.fromString(a.assetId), null,
       [asset.AssetInput.create(1, BigInt(coin.assets!.find(c => c.assetId === a.assetId)!.amount))], [asset.AssetOutput.create(0, a.amount)], [])))] : []),
     EmulatorPacket.create([{ vin: 1, script: covenant.renew, witness: RawWitness.encode([]) }]),
   ];
-  const proof = Intent.create(message, [input], [{ script: output.script, amount: output.amount }, Extension.create(packets).txOut()]);
+  const proof = Proof.create(message, [input], [{ script: output.script, amount: output.amount }, Extension.create(packets).txOut()]);
   return { proof, message, input };
 }
 
@@ -152,16 +111,15 @@ export function expectedIntentFee(chain: Chain, coin: VirtualCoin, output: Renew
   return BigInt(fee.satoshis);
 }
 
-/** The delegate never holds a key in the covenant: forfeits are signed by arkd and the emulator. */
-function withoutSigning(identity: Identity): Identity {
-  return { sign: async tx => tx, signMessage: (m, t) => identity.signMessage(m, t), signerSession: () => identity.signerSession(),
-    xOnlyPublicKey: () => identity.xOnlyPublicKey(), compressedPublicKey: () => identity.compressedPublicKey() };
-}
-
-export interface Delegate { identity: Identity; session: SignerSession; cosigner: string }
-export async function delegate(identity: Identity): Promise<Delegate> {
-  const session = identity.signerSession();
-  return { identity, session, cosigner: hex(await session.getPublicKey()) };
+/** Striker's tree-signer identity. The Renew leaf pins `cosigner`, so the key must be stable
+ * across batches (`TreeSignerSession` takes a secret directly, SDK ≥ 0.5.4) — but each batch
+ * needs a *fresh* session: a session's musig2 nonces must never be reused. `session()` makes one
+ * per round from the same secret, so the cosigner stays the pinned key. The delegate holds no key
+ * in the covenant; forfeits are signed by arkd and the emulator. */
+export interface Delegate { secret: Uint8Array; session: () => SignerSession; cosigner: string }
+export async function delegate(treeSignerSecret: Uint8Array): Promise<Delegate> {
+  const session = () => new TreeSignerSession(treeSignerSecret);
+  return { secret: treeSignerSecret, session, cosigner: hex(await session().getPublicKey()) };
 }
 
 /**
@@ -179,8 +137,8 @@ export async function renewThroughBatch(chain: Chain, striker: Delegate, intent:
   const primed = (async function* () { const f = await first; if (!f.done) yield f.value; yield* stream; })();
   try {
     const intentId = await chain.ark.registerIntent({ proof: approvedProof, message: intent.message });
-    const handler = arkade.createArkadeBatchHandler(intentId, [intent.input], withoutSigning(striker.identity), approvedProof, intent.message,
-      striker.session, chain.ark, chain.emulator, network);
+    const handler = arkade.createArkadeBatchHandler(intentId, [intent.input], undefined, approvedProof, intent.message,
+      striker.session(), chain.ark, chain.emulator, network);
     return await Batch.join(primed, handler, { abortController: abort });
   } finally { abort.abort(); }
 }

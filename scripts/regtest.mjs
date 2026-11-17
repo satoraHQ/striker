@@ -7,7 +7,7 @@ import path from 'node:path';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const checkout = path.join(root, '.cache/arkade-regtest');
 const environmentFile = path.resolve(process.env.STRIKER_REGTEST_ENV ?? path.join(root, ".env.regtest"));
-const revision = '9ac38fe94585bf99a65581d2e79eda63c7e61b6b';
+const revision = '7c91a6bdafd855ba8b8cc19cf35f46257eb1467d';
 function run(command, args, cwd = root) {
   const result = spawnSync(command, args, { cwd, stdio: 'inherit' });
   if (result.error) throw result.error;
@@ -22,13 +22,6 @@ if (!existsSync(path.join(checkout, '.git'))) {
 const actual = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: checkout, encoding: 'utf8' });
 if (actual.stdout?.trim() !== revision) throw new Error(`Regtest checkout must be pinned to ${revision}`);
 if (command === 'setup') process.exit(0);
-if (command === 'start') {
-  const config = parseEnv(readFileSync(environmentFile, 'utf8'));
-  if (config.EMULATOR_IMAGE === 'striker-emulator:v0.0.9-rc.2-striker.1') {
-    const found = spawnSync('docker', ['image', 'inspect', config.EMULATOR_IMAGE], { stdio: 'ignore' });
-    if (found.status !== 0) run('docker', ['build', '-f', 'docker/emulator.Dockerfile', '-t', config.EMULATOR_IMAGE, '.']);
-  }
-}
 run(process.execPath, [path.join(checkout, 'regtest.mjs'), command, '--env', environmentFile, ...args]);
 
 if (command === 'start') {

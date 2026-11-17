@@ -220,8 +220,9 @@ based on the emulator's non-interactive delegate pattern (`test/delegate_test.go
 - `OP_TUNNEL` forces the paired output to keep the same script, value and assets.
 - The leaf also checks `OP_PUSHEXPIRY <window> OP_SUB OP_CHECKTIME OP_VERIFY`, so renewal is
   only possible inside the window, and pins Striker's tree-signer key as the only cosigner.
-  That key must be stable: rotating it means every owner re-deposits. SDK 0.4.79 only
-  offers random signer sessions, so Striker needs a deterministic one.
+  That key must be stable: rotating it means every owner re-deposits. SDK ≥ 0.5.4 exports a
+  deterministic `TreeSignerSession` (constructed from a secret), so the pinned key is stable;
+  a fresh session is still built per batch, since musig2 nonces must never be reused.
 - Striker acts as delegate and renews offer covenants before expiry, and also after N fills,
   since renewal resets chain depth to 1 and keeps L1 exits cheap. Swap covenants are short-lived and normally settle or
   refund before needing renewal.
@@ -315,7 +316,8 @@ Before any service code, prove the covenants against the emulator and arkd on re
 
 ## 15. Spike results
 
-All 35 tests pass on regtest (arkd v0.9.16, emulator v0.0.9-rc.2-striker.1); see `spike/`.
+All 35 tests pass on regtest (arkd v0.9.25 with a standalone signer and postgres+redis,
+upstream emulator v0.0.10-rc.0, `@arkade-os/sdk` 0.5.6); see `spike/`.
 
 | §13 item | Result |
 |---|---|
@@ -327,6 +329,6 @@ All 35 tests pass on regtest (arkd v0.9.16, emulator v0.0.9-rc.2-striker.1); see
 | 6 Two makers, several takers | ✔ index pairing blocks shared-output attacks; 56 takers per maker, 9 makers per tx |
 | 7 Dust | ✔ exact sats both ways; maker never pays taker dust and vice versa |
 | 8 Swap covenant | ✔ fill at/above `min_rate`, fee, exact-out, deadline refund, key refund |
-| 9 Renew leaf | ✔ through a real batch with the fee-capped variant; exact-value needs a fee-free window (blocked only by regtest's 1 % fee) |
-| 10 Chain depth | ✔ no limit (1 000 deep), 15–25 ms per fill |
+| 9 Renew leaf | ✔ exact-value renewal settles fee-free through a real batch inside the fee window; the fee-capped variant also renews sats + USD through a batch |
+| 10 Chain depth | ✔ no limit (1 000 deep), ~30 ms per fill |
 | 11 L1 exit | ✔ 3 unroll packages (~0.7 k sats) + 146 vB owner-only exit after the CSV |

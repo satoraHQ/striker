@@ -1,9 +1,9 @@
 // Spike items 7 (taker dust) and 8 (swap covenant). Keys 60–79.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { connect, disposeWallets, fundedWallet, issueDemoUsd, publicKey, refused, secret, type Chain, type TestWallet } from './harness.js';
+import { connect, disposeWallets, fundedWallet, issueDemoUsd, publicKey, refused, rejectedWith, secret } from './harness.js';
 import { SingleKey } from '@arkade-os/sdk';
-import { BTC, deposit, fill, fillMany, outputAt, planFill, rejectedWith, submitViaArkd, submitViaEmulator, swapCovenant, swapSpend, type SwapTerms } from './swap.js';
+import { BTC, deposit, fill, fillMany, outputAt, planFill, submitViaArkd, submitViaEmulator, swapCovenant, swapSpend, type SwapTerms } from './swap.js';
 
 // $100,000 / BTC with an 8-decimal USD: 1 sat = 100_000 USD base units.
 const BTC_USD = { num: 100_000n, den: 1n };
@@ -11,11 +11,8 @@ const USD_BTC = { num: 1n, den: 100_000n };
 const now = () => BigInt(Math.floor(Date.now() / 1000));
 const usdOf = (v: { assets?: { assetId: string; amount: unknown }[] }, id: string) =>
   BigInt(String(v.assets?.find(a => a.assetId === id)?.amount ?? 0));
-/** `refused` plus: one of the new emulator error lines carries the expected text. */
-async function refusedWith(text: string, fn: () => Promise<unknown>) {
-  const lines = await refused(fn);
-  assert.ok(lines.some(l => l.includes(text)), `expected "${text}" in:\n${lines.join('\n')}`);
-}
+/** Covenant refusal whose emulator error names the failing check (see `fillScript`'s failure classes). */
+const refusedWith = (text: string, fn: () => Promise<unknown>) => refused(fn, text);
 
 test('swap covenant (DESIGN §5) and taker dust (§6)', { timeout: 900_000 }, async t => {
   t.after(disposeWallets);
@@ -25,7 +22,7 @@ test('swap covenant (DESIGN §5) and taker dust (§6)', { timeout: 900_000 }, as
   const user = await fundedWallet(chain, 61, 3_000_000);
   const striker = await fundedWallet(chain, 64, 0);
   const refundKey = SingleKey.fromPrivateKey(secret(63));
-  const usd = await issueDemoUsd(maker);
+  const usd = await issueDemoUsd(chain, maker);
   // Give the user some USD for the sell-USD direction.
   await maker.wallet.send({ address: user.address, amount: Number(D), assets: [{ assetId: usd, amount: 10_000n * 100_000_000n }] });
 

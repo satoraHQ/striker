@@ -1,16 +1,18 @@
 # v2 covenant spike
 
-Proves the covenants in `DESIGN.md` §13 against arkd + the pinned emulator on regtest.
+Proves the covenants in `DESIGN.md` §13 against arkd + the upstream emulator on regtest.
+35/35 green on arkd **v0.9.25** (standalone signer, postgres + redis), upstream emulator
+**ghcr.io/arkade-os/emulator:v0.0.10-rc.0**, `@arkade-os/sdk` **0.5.6**, arkade-regtest `7c91a6b`.
 
 ```sh
-npm run regtest -- start     # arkd v0.9.16 + emulator v0.0.9-rc.2-striker.1
-npm run spike                # all spike tests
+npm run regtest -- start            # pulls the images named in .env.regtest
+CHAIN_DEPTH=200 npm run spike       # all spike tests, sequential (--test-concurrency=1)
 node --import tsx --test spike/00-smoke.test.ts
 ```
 
 `harness.ts` holds the shared helpers (wallets, faucet, demo USD, covenant trees, submit,
-`refused`). Each area owns its own module and test file. Test key indices are allocated so
-parallel suites never share wallets:
+`refused`/`rejectedWith`). Each area owns its own module and test file. Test key indices are
+allocated so parallel suites never share wallets:
 
 | Keys | Area | Files |
 |---|---|---|
@@ -24,6 +26,39 @@ parallel suites never share wallets:
 
 - arkd rejects block-based CSV exit leaves (`INVALID_VTXO_SCRIPT: CSV block type not allowed`).
   Exit leaves must use seconds (multiple of 512).
+
+### Stack and SDK (v0.0.9-rc.2-striker.1 → upstream v0.0.10-rc.0, SDK 0.4.79 → 0.5.6)
+
+- **The checkpoint-signature fix is upstream now.** Our local patch (`docker/emulator-checkpoints.patch`,
+  built into `striker-emulator:v0.0.9-rc.2-striker.1`) is in v0.0.10-rc.0: the emulator submits
+  unsigned checkpoints to arkd and merges arkd's signatures for `FinalizeTx`, so reusable taker
+  covenants work on the stock image. The Dockerfile, patch and `.dockerignore` are gone and
+  `scripts/regtest.mjs` no longer builds a local image.
+- **Covenant failures are no longer logged; they come back in the HTTP error.** The SDK throws
+  `Failed to submit <tx|intent> to emulator: {"code":9,"message":"emulate offchain tx ark_txid=…:
+  input i: failed to execute arkade script: script=1 opcode=OP_X position=n: <reason>"}` (intents:
+  `emulate batch registration proof_txid=…`). Code 9 is gRPC `FailedPrecondition` (a well-formed
+  script whose check fails). arkd rejections relayed through the emulator keep arkd's own status
+  text (`TX_TOO_LARGE (46): …`, `ASSET_VALIDATION_FAILED (33): …`, `prevout tx value mismatch …`).
+  All the docker-log scraping helpers are gone; `harness.ts` parses the returned message once
+  (`rejectionOf`) and `refused(fn, /opcode or reason/)` / `rejectedWith(text, fn)` assert on it.
+  Only the batch-registration path still *also* logs `arkade script execution failed`.
+- **The emulator now names the opcode on a final-stack-check failure** (emulator #188): a leaf that
+  ends by leaving a false value on the stack reports e.g. `opcode=OP_GREATERTHANOREQUAL …: final
+  script validation failed: false stack entry at end of script execution`, not a bare
+  `script returned early`. The swap fee check and the fee-capped renew cap assert on this.
+- **arkd ≥ 0.9.22 finalizes an offchain tx inside `submitTx`** when the checkpoints arrive already
+  signed ("one shot"), and then refuses a separate `FinalizeTx`. The plain-arkd path
+  (`submitToArkd` in the harness) therefore only calls `finalizeTx` when arkd did *not* finalize on
+  submit (detected by comparing the returned checkpoint signatures against the ones we sent).
+- **SDK 0.5.6** (latest; its changelog pins arkd 0.9.25). Ported: `Intent` → `Proof` and
+  `intentTapLeafScript` → `proofTapLeafScript` (both deprecated aliases); the SDK now ships a
+  fetch-based `EventSource` (`resolveEventSource`), so the hand-rolled SSE shims in `renew.ts` /
+  `emulator-behaviour.ts` are gone; `TreeSignerSession` constructs from a secret, giving the Renew
+  leaf its stable pinned cosigner without a fork (a fresh session per batch — nonces must not be
+  reused); `createArkadeBatchHandler`'s signer arg is `Identity | undefined`, `undefined` for a
+  server+emulator-only leaf (no keyless-identity shim); `Wallet.offchainTapscript` yields the
+  wallet's forfeit leaf directly; `VirtualCoin.isPreconfirmed` replaced `virtualStatus.state`.
 
 ### Offer covenant (§13 items 1, 3, 4, 5, 6, maker side of 7) — `offer.ts`, `10-offer.test.ts`, `10-offer-batch.test.ts`
 
@@ -42,14 +77,15 @@ the input's index) → floor on the sell-side change balance → `sold ≥ min_f
 sold × rate_num` (BigNum `MUL`) → `<i> 5 <usd> 1 TUNNEL` (same script = same covenant and epoch; every
 non-USD asset preserved exactly).
 
-- **Everything in §3/§4 works on the pinned stack, both directions on one sats + USD VTXO,
-  payments landing in the change.** Refusals carry distinct texts: bad signature →
-  `signature verification failed`; wrong epoch → `OP_EQUALVERIFY failed`; expired, underpaid by
-  one unit, floor crossed, below `min_fill`, dust shifted → `OP_VERIFY failed`. Floor holds across
-  three chained partial fills and exactly onto the floor is allowed. Epoch bump = Owner-leaf
-  self-spend into the epoch+1 tree through arkd alone (no emulator); the old quotes then fail
-  `OP_EQUALVERIFY`, epoch+1 quotes fill. Lines are matched in the shared emulator log, so a
-  concurrent suite's failure can't masquerade as ours.
+- **Everything in §3/§4 works on the stack, both directions on one sats + USD VTXO,
+  payments landing in the change.** Refusals carry distinct texts in the returned error: bad
+  signature → `signature verification failed`; wrong epoch → `OP_EQUALVERIFY failed`; expired,
+  underpaid by one unit, floor crossed, below `min_fill`, dust shifted → `OP_VERIFY failed`. Floor
+  holds across three chained partial fills and exactly onto the floor is allowed. Epoch bump =
+  Owner-leaf self-spend into the epoch+1 tree through arkd alone (no emulator); the old quotes then
+  fail `OP_EQUALVERIFY`, epoch+1 quotes fill. `refused()` checks the message is a covenant
+  execution failure (`failed to execute arkade script`) and carries the expected opcode/reason, so
+  a transport or arkd error can't masquerade as a covenant refusal.
 - **`INSPECT*ASSET*` want the asset txid byte-reversed** relative to `AssetId.txid` / the
   serialized id (probe: raw → lookup misses, reversed → hit). Same as the archived PoC did.
 - **"All other asset balances preserved" is `OP_TUNNEL` flags 5 with USD as the one exception.**
@@ -61,10 +97,10 @@ non-USD asset preserved exactly).
   buying the dust at the quoted rate is just a larger fill. The maker never funds taker dust.
 - **Index pairing holds.** Two VTXOs of one offer (identical script) + one taker, output 0 built so
   that *both* inputs' balance arithmetic passes against it: (a) taker keeps the second balance at
-  output 1 → `OP_VERIFY failed vin=1`; (b) a decoy at output 1 with exactly a valid change's
-  balances but the taker's script → `selected output does not preserve source script vin=1`,
+  output 1 → `input 1: … OP_VERIFY failed`; (b) a decoy at output 1 with exactly a valid change's
+  balances but the taker's script → `input 1: … does not preserve source script`,
   i.e. the TUNNEL script check is the last line of defence. Honest 2 makers + 2 takers (one
-  selling BTC, one selling USD) in one tx: 10 378 WU.
+  selling BTC, one selling USD) in one tx: ~9 900 WU.
 - **Size (arkd `maxTxWeight` 40 000, `txFeeRate` 0):** 1 maker + 1 taker fill 5 106–5 158 WU;
   each extra plain-wallet taker **630 WU** (input + sig + output + packet entries); each extra
   maker **4 090 WU** (644 B script + 212 B witness in the OP_RETURN at 4 WU/B, plus input and
@@ -77,10 +113,11 @@ non-USD asset preserved exactly).
   before `emulator.submitTx`, input leaf = the coin's `forfeitTapLeafScript`. `attachPrevArkTxs`
   takes one txid *per input* (positional), not a set.
 - **arkd's indexer pages at 100 and `pageIndex` is 1-based** (0 and 1 return the same page;
-  `page.total` counts from 1). The harness `coinsAt` therefore silently truncates at 100 coins;
-  `offer.ts` `allCoinsAt` paginates and dedupes and belongs in the harness, as does
-  `walletCoins` (indexer coins + the wallet's tap leaves; the SDK wallet's `getVtxos` is a
-  20 s-polled snapshot that doesn't see emulator-side spends).
+  `page.total` counts from 1). The harness `coinsAt` walks 1..total and dedupes by outpoint, so it
+  no longer truncates at 100; `walletCoins` adds the wallet's tap leaves on top (the SDK wallet's
+  own `getVtxos` is a 20 s-polled snapshot that doesn't see emulator-side spends, so every suite
+  reads coins from the indexer instead). The per-wallet tap leaves come from
+  `Wallet.offchainTapscript` (`.forfeit()`), not from reading a live vtxo.
 - **The faucet CLI wallet ran dry mid-spike** (1.9 M sats → 0 with several suites drawing from
   it). The offer suites now reuse their deterministic wallets (`ensureFunded` tops up only the
   shortfall), reuse one demo USD across runs (`demoUsd`) and reclaim every leftover offer VTXO
@@ -136,9 +173,10 @@ non-USD asset preserved exactly).
 - **The emulator error tells you which check failed**, given how the script is laid out. The
   leaf uses different opcodes on purpose: deadline → `OP_NUMEQUALVERIFY failed`, destination →
   `OP_EQUALVERIFY failed`, rate/amount → `OP_VERIFY failed`, exact-out refund → `script
-  returned early`, fee (last check) → `false stack entry`. arkd rejections relayed through the
-  emulator appear as `failed to process transaction`, not as `failed to execute arkade script`.
-  `swap.ts` `rejectedWith()` covers both and belongs in the harness.
+  returned early`, fee (last check) → `false stack entry`. Covenant refusals carry `failed to
+  execute arkade script`; arkd rejections relayed through the emulator carry arkd's own status
+  (`ASSET_INPUT_INVALID`, `prevout tx value mismatch`, …). The harness `refused()` asserts the
+  former, `rejectedWith(text)` the latter.
 - **A plain wallet can co-sign a covenant fill.** Use the wallet's `forfeitTapLeafScript`,
   `identity.sign(arkTx, [i])`, *and* sign its checkpoint (`identity.sign(cp, [0])`) before
   submitting to the emulator. As finalizer, the emulator requires all non-arkd checkpoint
@@ -150,12 +188,17 @@ non-USD asset preserved exactly).
 
 ### Emulator behaviour: late submission, chain depth, tx size (§13 items 2, 10) — `emulator-behaviour.ts`, `30-emulator*.test.ts`
 
-Source refs: emulator = `/tmp/striker-emulator-pinned` (v0.0.9-rc.2 + `docker/emulator-checkpoints.patch`),
-arkd = tag v0.9.16.
+Source refs: emulator = `github.com/arkade-os/emulator` tag v0.0.10-rc.0, arkd = tag v0.9.25.
+Line numbers below are from v0.0.9-rc.2 unless noted; the offchain/intent/finalize logic that the
+late-submission findings rest on is unchanged in v0.0.10-rc.0 (the service was refactored to split
+script execution from signing — `pkg/emulator/service.go`, `internal/application/{service,signer,
+finalize}.go` — but `SubmitTx` still submits-and-finalizes in one call, `SubmitIntent` still returns
+the signed proof without registering it, and `SubmitFinalization` still signs forfeits without
+re-running the script).
 
 - **`OP_CHECKTIME` uses the emulator host's wall clock**, read once per input when the
-  engine is built (`pkg/arkade/engine.go:704` `time.Now().Unix()`; opcode `opcode.go:985`
-  pushes `timestamp <= now`). It is checked only when the emulator signs. arkd's clock plays
+  engine is built (`time.Now().Unix()`; the opcode pushes `timestamp <= now`). It is checked
+  only when the emulator signs. arkd's clock plays
   no part in the offchain path. No skew bound exists between emulator replicas (same key, other
   host) or towards arkd. The regtest containers share the host clock.
 - **Offchain, emulator as finalizer: no late submission.** `SubmitTx`
@@ -194,8 +237,10 @@ arkd = tag v0.9.16.
   batch) were all accepted. The tip stays `preconfirmed`. arkd tracks `Depth` only to place DAG
   markers every 100 (`internal/core/domain/marker.go:7`, `application/service.go:1133-1158`).
   No setting caps depth, pending txs or checkpoints. **Latency** of one emulator `SubmitTx`
-  (run script + sign + arkd submit + finalize, local docker): p50 15–18 ms, p95 18–22 ms,
-  max 54 ms, flat from depth 1 to 1000. Fetching the previous ark tx from the indexer adds ~6 ms.
+  (run script + sign + arkd submit + finalize, local docker): p50 ~30 ms, p95 ~34 ms, max ~37 ms,
+  flat across depth (measured to 200; 1 000 still accepted). The v0.9.25 stack (standalone signer,
+  postgres + redis) is ~15 ms slower per call than the v0.9.16 single-process one (p50 15–18 ms).
+  Fetching the previous ark tx from the indexer adds ~6 ms.
   The real cost of depth is the L1 exit: unrolling a depth-d VTXO publishes d ark txs plus d
   checkpoints, each needing an anchor bump.
 - **Tx size (arkd `maxTxWeight` 40 000, checked on the final signed tx after the emulator
@@ -241,36 +286,36 @@ emulator `test/delegate_test.go`): `PUSHEXPIRY <window> SUB CHECKTIME VERIFY`, t
   refuses it: `ASSET_VALIDATION_FAILED: asset packet not found` (`pkg/ark-lib/asset/
   tx_validation.go:33`, "reject transaction spending asset vtxos without asset packet").
   Same class as the swap finding above: asset conservation is arkd's job, not the covenant's.
-- **arkd's fee program is the only blocker for exact-value renewal on this stack.** The
-  emulator co-signs the exact-value proof; `registerIntent` answers
-  `INTENT_INSUFFICIENT_FEE (31): got 0 min expected 200` for a 20 000-sat input under the
-  regtest program `offchainInput: amount * 0.01`. `Intent.fee = Σinputs − Σoutputs`, so an
-  exact-value OP_TUNNEL output can never pay it. The test computes the fee with the SDK
-  `Estimator` from `/v1/info` and runs the batch only when it is 0.
-  **To re-run fee-free** (in isolation; it reconfigures the shared arkd): set in `.env.regtest`
+- **Exact-value renewal settles fee-free through a real batch.** `.env.regtest` now sets the
+  Mutinynet-style fee program
   `ARK_OFFCHAIN_INPUT_FEE=inputType == 'vtxo' && expiry - now() > 518656.0 ? amount * 0.002 : 0.0`
-  (Mutinynet's program; mainnet uses 2505216.0) and `npm run regtest -- start`, which POSTs it
-  to `http://localhost:7071/v1/admin/intentFees` (`.cache/arkade-regtest/lib/setup/arkd.mjs`
-  `applyArkdFees`, from the arkd container env `ARK_OFFCHAIN_INPUT_FEE` in
-  `docker/compose.ark.yml`) and re-inits the faucet CLI. The CEL variables are `amount`,
-  `expiry`, `birth`, `weight`, `inputType` and `now()` (arkd `pkg/ark-lib/arkfee/celenv`).
-  With the 86 400 s regtest expiry every VTXO is inside the window, so the fee is 0 and
-  `40-renew.test.ts` then settles the exact-value renewal through a real batch. The SDK
-  `Estimator` evaluates that program correctly (0 near expiry, 40 sats for a 30-day VTXO).
+  (mainnet uses `2505216.0`; it is POSTed to arkd's `/v1/admin/intentFees` at
+  `npm run regtest -- start` by `.cache/arkade-regtest/lib/setup/arkd.mjs` `applyArkdFees`, from the
+  arkd container env `ARK_OFFCHAIN_INPUT_FEE`). With the 86 400 s regtest vtxo-tree expiry every
+  VTXO is inside the ~6-day window, so `offchainInput` evaluates to 0. The emulator co-signs the
+  exact-value proof, `registerIntent` accepts it for 0 fee, and the delegate drives a real batch to
+  a commitment — `Intent.fee = Σinputs − Σoutputs = 0`, which an exact-value `OP_TUNNEL` output can
+  pay. The test reads the program from `/v1/info` with the SDK `Estimator`; **should the program
+  ever charge** (e.g. the stock `amount * 0.01`), the proof still passes the covenant and the test
+  records arkd's `INTENT_INSUFFICIENT_FEE (31): got 0 min expected 200` instead. The CEL variables
+  are `amount`, `expiry`, `birth`, `weight`, `inputType` and `now()` (arkd `pkg/ark-lib/arkfee/celenv`);
+  the `Estimator` evaluates the program correctly (0 near expiry, ~40 sats for a 30-day VTXO).
 - **Fee-capped variant (tested through a real batch):** `TUNNEL` flags 5 (script + assets)
-  plus `out.value ≥ in.value − maxFee` via `INSPECTOUTPUTVALUE`/`INSPECTINPUTVALUE`. With
-  `maxFee` 250 and the 1 % program, the delegate deducted exactly the 200-sat fee; deducting 251
-  is refused by the covenant. This is the shape to use if a server ever charges for renewal; the
-  cap must be an absolute number baked into the script (bps would need `MUL`/`DIV`, which the
-  emulator has, but the fee program can change under the covenant anyway).
-- **The SDK needs an `EventSource` in Node** for `getEventStream`; Node 24 has none without
-  `--experimental-eventsource`. `renew.ts` `ensureEventSource()` installs a fetch-based SSE
-  shim through `configureEventSource` (arkd serves plain `data: {...}` SSE). `Wallet.settle`
-  needs the same.
-- **SDK 0.4.79 has no exported deterministic `TreeSignerSession`**; `identity.signerSession()`
-  is `TreeSignerSession.random()`. The Renew leaf pins the cosigner key, so a production Striker
-  needs a stable tree-signer key (fork/export the class, or implement `SignerSession`). The spike
-  creates the session before building the script.
+  plus `out.value ≥ in.value − maxFee` via `INSPECTOUTPUTVALUE`/`INSPECTINPUTVALUE`. The test
+  deducts max(arkd's required fee, 200) sats so a real fee is paid under a `maxFee` 250 cap even
+  when arkd asks for 0; deducting 251 is refused by the covenant
+  (`opcode=OP_GREATERTHANOREQUAL …: false stack entry`). This is the shape to use if a server ever
+  charges for renewal; the cap must be an absolute number baked into the script (bps would need
+  `MUL`/`DIV`, which the emulator has, but the fee program can change under the covenant anyway).
+- **SDK 0.5.6 ships a Node `EventSource`.** `resolveEventSource` falls back to a built-in
+  fetch-based SSE client when `globalThis.EventSource` is absent (Node has none without
+  `--experimental-eventsource`), so the hand-rolled shims were removed; `getEventStream` and
+  `Wallet.settle` work out of the box.
+- **SDK 0.5.4+ exports a deterministic `TreeSignerSession`** (constructed from a 32-byte secret),
+  so the Renew leaf's pinned cosigner is a stable key with no fork. A *fresh* session is built per
+  batch (`delegate.session()`), because a session's musig2 nonces must never be reused — reusing
+  one across the exact-value and fee-capped renewals in the suite fails with
+  `INVALID_TREE_NONCES (60): missing musig2 nonce for txid …`.
 - **L1 exit works with only the owner key.** `Unroll.Session` (SDK) + an `OnchainWallet` as
   P2A bumper unrolled a pre-confirmed covenant VTXO whose chain was
   `ARK → CHECKPOINT → ARK → CHECKPOINT → TREE → COMMITMENT`: **3 1C1P packages** (tree leaf
