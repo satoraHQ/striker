@@ -6,7 +6,7 @@ import { arkade, asset, buildOffchainTx, EmulatorPacket, Extension, Transaction,
 import { RawWitness } from '@scure/btc-signer';
 import { schnorr } from '@noble/curves/secp256k1.js';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { coinsAt, covenantTree, exitLeaf, fundedWallet, issueDemoUsd, ownerLeaf, submitToArkd, walletCoins, type Chain, type TestWallet } from './harness.js';
+import { coinsAt, covenantLeaf, exitLeaf, fundedWallet, issueDemoUsd, ownerLeaf, submitToArkd, walletCoins, type Chain, type TestWallet } from './harness.js';
 
 type Ops = Parameters<typeof arkade.ArkadeScript.encode>[0];
 
@@ -15,30 +15,30 @@ type Ops = Parameters<typeof arkade.ArkadeScript.encode>[0];
 /** BTC is the all-zero 34-byte asset id. Demo USD is its serialized asset id (txid ‖ u16 LE gidx). */
 export const BTC = new Uint8Array(34);
 export const QUOTE_TAG = 'striker/quote/v2';
-/** BIP340 tagged-hash prefix: SHA256(tag) ‖ SHA256(tag). The script concatenates it with the quote. */
-export const TAG_PREFIX = (() => { const h = sha256(new TextEncoder().encode(QUOTE_TAG)); return concat(h, h); })();
 export const MAX_U63 = (1n << 63n) - 1n;
 
-/**
- * Quote byte layout (148 bytes, every integer u64 LE < 2^63 so BIN2NUM reads it as positive):
- *   [0,32)    maker_pubkey (x-only)
- *   [32,40)   epoch
- *   [40,74)   sell_asset (34 bytes; BTC = zeros)
- *   [74,108)  buy_asset
- *   [108,116) rate_num     buy ≥ sell × rate_num / rate_den
- *   [116,124) rate_den
- *   [124,132) floor        change sell-side balance ≥ floor
- *   [132,140) min_fill     sold ≥ min_fill
- *   [140,148) expiry       unix seconds; valid while expiry > emulator time
- * The protocol version lives in the signature tag, not in the message.
- */
-export const OFF = { maker: 0, epoch: 32, sell: 40, buy: 74, rateNum: 108, rateDen: 116, floor: 124, minFill: 132, expiry: 140 } as const;
-export const QUOTE_LENGTH = 148;
+/** Which asset the maker sells. Each side is its own Fill leaf, so the side is bound by the
+ * leaf's tag hash rather than by a field in the quote. */
+export const SELL_BTC = 0, SELL_USD = 1;
+export type Side = typeof SELL_BTC | typeof SELL_USD;
 
-export interface Quote {
-  maker: Uint8Array; epoch: bigint; sell: Uint8Array; buy: Uint8Array;
-  rateNum: bigint; rateDen: bigint; floor: bigint; minFill: bigint; expiry: bigint;
-}
+/**
+ * Quote byte layout (40 bytes, every integer u64 LE < 2^63 so BIN2NUM reads it as positive):
+ *   [0,8)    rate_num     buy ≥ sell × rate_num / rate_den
+ *   [8,16)   rate_den
+ *   [16,24)  floor        change sell-side balance ≥ floor
+ *   [24,32)  min_fill     sold ≥ min_fill
+ *   [32,40)  expiry       unix seconds; valid while expiry > emulator time
+ * Everything that identifies the covenant — protocol version, maker key, epoch, the USD asset
+ * and the side — is in the BIP340 tag instead (`quoteTag`), so a quote verifies only against
+ * the one Fill leaf it was signed for and costs nothing in the message.
+ */
+export const OFF = { rateNum: 0, rateDen: 8, floor: 16, minFill: 24, expiry: 32 } as const;
+export const QUOTE_LENGTH = 40;
+
+export interface Quote { side: Side; rateNum: bigint; rateDen: bigint; floor: bigint; minFill: bigint; expiry: bigint }
+/** What the signature tag binds a quote to: one maker key, one epoch, one demo-USD asset. */
+export interface QuoteContext { maker: Uint8Array; epoch: bigint; usd: string | Uint8Array }
 
 export function concat(...parts: Uint8Array[]): Uint8Array {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
@@ -54,19 +54,29 @@ export function u64(v: bigint): Uint8Array {
 }
 export const assetBytes = (id: string | Uint8Array) => typeof id === 'string' ? asset.AssetId.fromString(id).serialize() : id;
 
+/** `"striker/quote/v2" ‖ maker(32) ‖ epoch(u64 LE) ‖ usd_asset(34) ‖ side(1)`. */
+export function quoteTag(ctx: QuoteContext, side: Side): Uint8Array {
+  assert.equal(ctx.maker.length, 32);
+  const usd = assetBytes(ctx.usd);
+  assert.equal(usd.length, 34);
+  return concat(new TextEncoder().encode(QUOTE_TAG), ctx.maker, u64(ctx.epoch), usd, Uint8Array.of(side));
+}
+/** SHA256(tag): the one 32-byte constant the Fill leaf carries for the hash. */
+export const quoteTagHash = (ctx: QuoteContext, side: Side) => sha256(quoteTag(ctx, side));
+
 export function encodeQuote(q: Quote): Uint8Array {
-  assert.equal(q.maker.length, 32); assert.equal(q.sell.length, 34); assert.equal(q.buy.length, 34);
   if (q.rateNum <= 0n || q.rateDen <= 0n || q.minFill <= 0n) throw new RangeError('rate and min_fill must be positive');
-  const m = concat(q.maker, u64(q.epoch), q.sell, q.buy, u64(q.rateNum), u64(q.rateDen), u64(q.floor), u64(q.minFill), u64(q.expiry));
+  const m = concat(u64(q.rateNum), u64(q.rateDen), u64(q.floor), u64(q.minFill), u64(q.expiry));
   assert.equal(m.length, QUOTE_LENGTH);
   return m;
 }
-export const quoteHash = (m: Uint8Array) => sha256(concat(TAG_PREFIX, m));
-export function signQuote(q: Quote, secret: Uint8Array): { message: Uint8Array; signature: Uint8Array } {
+/** BIP340 tagged hash: SHA256(SHA256(tag) ‖ SHA256(tag) ‖ quote). */
+export const quoteHash = (ctx: QuoteContext, side: Side, m: Uint8Array) => { const h = quoteTagHash(ctx, side); return sha256(concat(h, h, m)); };
+export function signQuote(ctx: QuoteContext, q: Quote, secret: Uint8Array): { message: Uint8Array; signature: Uint8Array } {
   const message = encodeQuote(q);
-  return { message, signature: schnorr.sign(quoteHash(message), secret) };
+  return { message, signature: schnorr.sign(quoteHash(ctx, q.side, message), secret) };
 }
-export const verifyQuote = (m: Uint8Array, sig: Uint8Array, pk: Uint8Array) => schnorr.verify(sig, quoteHash(m), pk);
+export const verifyQuote = (ctx: QuoteContext, side: Side, m: Uint8Array, sig: Uint8Array) => schnorr.verify(sig, quoteHash(ctx, side, m), ctx.maker);
 
 // ------------------------------------------------------------- covenant (§4)
 
@@ -76,62 +86,61 @@ function assetOps(id34: Uint8Array): Ops {
   const gidx = new DataView(id34.buffer, id34.byteOffset + 32, 2).getUint16(0, true);
   return [id34.slice(0, 32).reverse(), gidx];
 }
-const field = (off: number, len = 8): Ops => ['DUP', off, len, 'SUBSTR'];
-const num = (off: number): Ops => [...field(off), 'BIN2NUM'];
+/** Reads an 8-byte quote field as a number; expects the quote on top, keeps it. */
+const num = (off: number): Ops => ['DUP', off, 8, 'SUBSTR', 'BIN2NUM'];
+const sats = (op: 'INSPECTINPUTVALUE' | 'INSPECTOUTPUTVALUE'): Ops => ['PUSHCURRENTINPUTINDEX', op];
+/** USD balance of this input/output. The asset id lives on the altstack as [gidx txid] (txid on
+ * top); it is pulled, copied back, and consumed by the lookup. 0 when the asset is absent. */
+const usd = (op: 'INSPECTINASSETLOOKUP' | 'INSPECTOUTASSETLOOKUP'): Ops =>
+  ['FROMALTSTACK', 'FROMALTSTACK', '2DUP', 'TOALTSTACK', 'TOALTSTACK', 'PUSHCURRENTINPUTINDEX', 'ROT', 'ROT', op, 'DROP'];
 
 /**
- * Fill leaf. Witness: [signature, quote]. Change is at the output whose index equals this
- * input's index. Balance deltas are measured on this input/output pair only, so the covenant
- * never looks at taker outputs.
+ * One-direction Fill leaf. Witness: [signature, quote]. Change is at the output whose index
+ * equals this input's index. Balance deltas are measured on this input/output pair only, so the
+ * covenant never looks at taker outputs. Maker key, epoch, asset and side are bound through the
+ * tag hash constant: a quote for another epoch, asset or side fails the signature check.
  */
-export function fillScript(maker: Uint8Array, epoch: bigint, usd: Uint8Array): Uint8Array {
-  const U = assetOps(usd);
-  const i: Ops = ['PUSHCURRENTINPUTINDEX'];
-  const satsIn: Ops = [...i, 'INSPECTINPUTVALUE'];
-  const satsOut: Ops = [...i, 'INSPECTOUTPUTVALUE'];
-  const usdIn: Ops = [...i, ...U, 'INSPECTINASSETLOOKUP', 'DROP'];    // 0 when the asset is absent
-  const usdOut: Ops = [...i, ...U, 'INSPECTOUTASSETLOOKUP', 'DROP'];
+export function fillScript(ctx: QuoteContext, side: Side): Uint8Array {
+  const [sellIn, sellOut, buyIn, buyOut] = side === SELL_BTC
+    ? [sats('INSPECTINPUTVALUE'), sats('INSPECTOUTPUTVALUE'), usd('INSPECTINASSETLOOKUP'), usd('INSPECTOUTASSETLOOKUP')]
+    : [usd('INSPECTINASSETLOOKUP'), usd('INSPECTOUTASSETLOOKUP'), sats('INSPECTINPUTVALUE'), sats('INSPECTOUTPUTVALUE')];
   return arkade.ArkadeScript.encode([
     // --- offchain only: an intent proof must never satisfy this leaf (see the emulator findings in
     //     README.md: a proof co-signed before expiry can be registered in a batch after it).
     new TextEncoder().encode('type'), 'INSPECTINTENTMESSAGE', 'NOT', 'VERIFY', 'DROP',
-    // --- quote authenticity: sig over tagged_hash(TAG, quote) by the maker key baked in here
-    'DUP', 'TOALTSTACK', TAG_PREFIX, 'SWAP', 'CAT', 'SHA256', maker, 'CHECKSIGFROMSTACK', 'VERIFY',
-    'FROMALTSTACK', 'SIZE', QUOTE_LENGTH, 'EQUALVERIFY',
-    ...field(OFF.maker, 32), maker, 'EQUALVERIFY',
-    ...field(OFF.epoch), u64(epoch), 'EQUALVERIFY',               // epoch is part of the script
-    ...num(OFF.expiry), 'CHECKTIME', 'NOT', 'VERIFY',             // valid only before expiry
-    // --- direction: stack [q] → [q sold received], and floor on the sell-side change balance
-    ...field(OFF.sell, 34), BTC, 'EQUAL',
-    'IF',                                                          // maker sells BTC, buys USD
-      ...field(OFF.buy, 34), usd, 'EQUALVERIFY',
-      ...satsIn, ...satsOut, 'SUB',                                // sold = sats_in − sats_out
-      ...usdOut, ...usdIn, 'SUB',                                  // received = usd_out − usd_in
-      ...satsOut, 3, 'PICK', OFF.floor, 8, 'SUBSTR', 'BIN2NUM', 'GREATERTHANOREQUAL', 'VERIFY',
-    'ELSE',                                                        // maker sells USD, buys BTC
-      ...field(OFF.sell, 34), usd, 'EQUALVERIFY',
-      ...field(OFF.buy, 34), BTC, 'EQUALVERIFY',
-      ...usdIn, ...usdOut, 'SUB',                                  // sold = usd_in − usd_out
-      ...satsOut, ...satsIn, 'SUB',                                // received = sats_out − sats_in
-      ...usdOut, 3, 'PICK', OFF.floor, 8, 'SUBSTR', 'BIN2NUM', 'GREATERTHANOREQUAL', 'VERIFY',
-    'ENDIF',
-    // --- fill rules, stack [q sold received]
-    'OVER', 3, 'PICK', OFF.minFill, 8, 'SUBSTR', 'BIN2NUM', 'GREATERTHANOREQUAL', 'VERIFY',   // sold ≥ min_fill
-    'DUP', 3, 'PICK', OFF.rateDen, 8, 'SUBSTR', 'BIN2NUM', 'MUL',                           // received × rate_den
-    2, 'PICK', 4, 'PICK', OFF.rateNum, 8, 'SUBSTR', 'BIN2NUM', 'MUL',                       // sold × rate_num
-    'GREATERTHANOREQUAL', 'VERIFY',                                                          // rounded in the maker's favour
-    '2DROP', 'DROP',
+    // --- quote authenticity: BIP340 over tagged_hash(tag, quote); SHA256(tag) pushed once, doubled with CAT
+    'DUP', 'TOALTSTACK', quoteTagHash(ctx, side), 'DUP', 'CAT', 'SWAP', 'CAT', 'SHA256', ctx.maker, 'CHECKSIGFROMSTACK', 'VERIFY',
+    'FROMALTSTACK', 'SIZE', QUOTE_LENGTH, 'EQUALVERIFY',                                   // [q]
+    ...num(OFF.expiry), 'CHECKTIME', 'NOT', 'VERIFY',                                      // valid only before expiry
+    ...assetOps(assetBytes(ctx.usd)), 'TOALTSTACK', 'TOALTSTACK',                           // USD id parked on the altstack
+    // --- sold = sell_in − sell_out, with the floor on the sell-side change balance
+    ...sellIn, ...sellOut, 'TUCK', 'SUB',                                                   // [q sell_out sold]
+    'SWAP', 2, 'PICK', OFF.floor, 8, 'SUBSTR', 'BIN2NUM', 'GREATERTHANOREQUAL', 'VERIFY',    // sell_out ≥ floor      → [q sold]
+    'DUP', 2, 'PICK', OFF.minFill, 8, 'SUBSTR', 'BIN2NUM', 'GREATERTHANOREQUAL', 'VERIFY',   // sold ≥ min_fill
+    // --- received = buy_out − buy_in, then received × rate_den ≥ sold × rate_num (maker's favour)
+    ...buyOut, ...buyIn, 'SUB',                                                             // [q sold received]
+    'ROT', ...num(OFF.rateDen), 'ROT', 'MUL',                                               // [sold q received×den]
+    'SWAP', OFF.rateNum, 8, 'SUBSTR', 'BIN2NUM', 'ROT', 'MUL',                              // [received×den sold×num]
+    'GREATERTHANOREQUAL', 'VERIFY',
     // --- change keeps this exact script (same covenant, same epoch) and every non-USD asset.
-    ...i, 5, ...U, 1, 'TUNNEL',
+    'PUSHCURRENTINPUTINDEX', 5, 'FROMALTSTACK', 'FROMALTSTACK', 1, 'TUNNEL',
   ]);
 }
 
-export interface Offer { maker: Uint8Array; epoch: bigint; usd: string; script: Uint8Array; tree: VtxoScript; address: string }
-/** Leaves: 0 fill (server + emulator⊕script), 1 owner (maker + server), 2 exit (maker, CSV seconds). */
+export interface Offer extends QuoteContext {
+  usd: string;
+  /** Fill scripts by side: `fill[SELL_BTC]`, `fill[SELL_USD]`. */
+  fill: [Uint8Array, Uint8Array];
+  tree: VtxoScript; address: string;
+}
+/** Leaf index of each spend path in the offer tree. */
+export const LEAF = { sellBtc: 0, sellUsd: 1, owner: 2, exit: 3 } as const;
+/** Leaves: 0 fill sell-BTC, 1 fill sell-USD (server + emulator⊕script), 2 owner (maker + server), 3 exit (maker, CSV seconds). */
 export function offerTree(chain: Chain, maker: Uint8Array, epoch: bigint, usd: string, exitSeconds = 1536n): Offer {
-  const script = fillScript(maker, epoch, assetBytes(usd));
-  const tree = covenantTree(chain, script, [ownerLeaf(chain, maker), exitLeaf(maker, exitSeconds)]);
-  return { maker, epoch, usd, script, tree, address: tree.address('tark', chain.server).encode() };
+  const ctx = { maker, epoch, usd };
+  const fill: [Uint8Array, Uint8Array] = [fillScript(ctx, SELL_BTC), fillScript(ctx, SELL_USD)];
+  const tree = new VtxoScript([...fill.map(s => covenantLeaf(chain, s)), ownerLeaf(chain, maker), exitLeaf(maker, exitSeconds)]);
+  return { ...ctx, fill, tree, address: tree.address('tark', chain.server).encode() };
 }
 
 // ------------------------------------------------------------ tx builder
@@ -158,7 +167,7 @@ export function walletInput(coin: ExtendedVirtualCoin, signer: SingleKey): TxInp
 }
 /** The owner leaf of a covenant VTXO (maker + server), signed by the maker. */
 export function ownerInput(coin: Coin, tree: VtxoScript, signer: SingleKey): TxInput {
-  return { coin, tapTree: tree.encode(), tapLeafScript: tree.leaves[1]!, signer };
+  return { coin, tapTree: tree.encode(), tapLeafScript: tree.leaves[LEAF.owner]!, signer };
 }
 export interface TxOutput { script: Uint8Array; amount: bigint; assets?: { assetId: string; amount: bigint }[] }
 
@@ -196,20 +205,19 @@ export async function buildTx(chain: Chain, inputs: TxInput[], outputs: TxOutput
 
 export interface FillPlan {
   offer: Offer; coin: Coin; quote: Quote; signature: Uint8Array; message: Uint8Array;
-  /** Maker sells `sold` of quote.sell and receives `received` of quote.buy. */
+  /** Maker sells `sold` of the quote's sell side and receives `received` of the other asset. */
   sold: bigint; received: bigint;
 }
 export const usdOf = (coin: Coin, usd: string) => BigInt(coin.assets?.find(a => a.assetId === usd)?.amount ?? 0);
-export const isBtc = (id: Uint8Array) => id.every(b => b === 0);
 
-/** Maker input + its paired change output, with the payment folded into the change. */
+/** Maker input (the Fill leaf of the quote's side) + its paired change output, with the payment folded into the change. */
 export function makerLeg(p: FillPlan): { input: TxInput; change: TxOutput } {
   const sats = BigInt(p.coin.value), usd = usdOf(p.coin, p.offer.usd);
-  const sellBtc = isBtc(p.quote.sell);
+  const sellBtc = p.quote.side === SELL_BTC;
   const satsOut = sellBtc ? sats - p.sold : sats + p.received;
   const usdOut = sellBtc ? usd + p.received : usd - p.sold;
   return {
-    input: covenantInput(p.coin, p.offer.tree, p.offer.script, [p.signature, p.message]),
+    input: covenantInput(p.coin, p.offer.tree, p.offer.fill[p.quote.side], [p.signature, p.message], p.quote.side),
     change: { script: p.offer.tree.pkScript, amount: satsOut, assets: usdOut > 0n ? [{ assetId: p.offer.usd, amount: usdOut }] : [] },
   };
 }

@@ -60,6 +60,21 @@ export function regtest(...args: string[]) {
 
 /** The tap leaves a plain SDK wallet spends its VTXOs with (forfeit leaf for both offchain txs and proofs). */
 export interface WalletLeaves { tapTree: Uint8Array; forfeitTapLeafScript: TapLeafScript; proofTapLeafScript: TapLeafScript }
+/** Tops up the regtest CLI wallet (the faucet behind `ark send`) by boarding
+ * on-chain coins, so long suites don't drain it. */
+export function refillFaucet(needed: number, btc = 5) {
+  const offchain = () => Number(JSON.parse(regtest('ark', 'balance')).offchain_balance?.total ?? 0);
+  if (offchain() >= needed + 1_000_000) return;
+  const { boarding_address } = JSON.parse(regtest('ark', 'receive'));
+  regtest('faucet', boarding_address, String(btc), '--confirm');
+  // The CLI may not see the boarding coin yet; settle until it lands.
+  for (let attempt = 0; attempt < 10 && offchain() < needed + 1_000_000; attempt++) {
+    try { regtest('ark', 'settle', '--password', 'secret'); } catch { /* nothing to settle yet */ }
+    if (offchain() < needed + 1_000_000) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2_000);
+  }
+  if (offchain() < needed) throw new Error('Faucet refill did not settle');
+}
+
 export interface TestWallet { wallet: Wallet; identity: SingleKey; address: string; publicKey: Uint8Array; pkScript: Uint8Array; leaves: WalletLeaves }
 const wallets: Wallet[] = [];
 export async function disposeWallets() { await Promise.all(wallets.splice(0).map(w => w.dispose())); }
@@ -77,6 +92,7 @@ export async function fundedWallet(chain: Chain, n: number, sats = 1_000_000): P
   const address = await wallet.getAddress();
   const before = (await wallet.getBalance()).total;
   if (sats > 0) {
+    refillFaucet(sats);
     regtest('ark', 'send', '--to', address, '--amount', String(sats), '--password', 'secret');
     await waitFor(async () => (await wallet.getBalance()).total >= before + sats ? true : undefined, 'wallet funding');
   }

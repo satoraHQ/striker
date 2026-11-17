@@ -1,7 +1,7 @@
 # v2 covenant spike
 
 Proves the covenants in `DESIGN.md` §13 against arkd + the upstream emulator on regtest.
-35/35 green on arkd **v0.9.25** (standalone signer, postgres + redis), upstream emulator
+54/54 green on a fresh arkd **v0.9.25** (standalone signer, postgres + redis), upstream emulator
 **ghcr.io/arkade-os/emulator:v0.0.10-rc.0**, `@arkade-os/sdk` **0.5.6**, arkade-regtest `7c91a6b`.
 
 ```sh
@@ -21,6 +21,7 @@ allocated so parallel suites never share wallets:
 | 40–59 | emulator behaviour: late submission, chain depth (§13 2, 10) | `30-emulator*.test.ts` |
 | 60–79 | swap covenant + taker dust (§13 7, 8) | `swap.ts`, `20-swap*.test.ts` |
 | 80–99 | renewal + L1 exit (§13 9, 11) | `renew.ts`, `40-renew*.test.ts` |
+| 100–109 | asset claims vs arkd (§14) | `asset-claims.ts`, `50-asset-claims.test.ts` |
 
 ## Findings
 
@@ -62,28 +63,36 @@ allocated so parallel suites never share wallets:
 
 ### Offer covenant (§13 items 1, 3, 4, 5, 6, maker side of 7) — `offer.ts`, `10-offer.test.ts`, `10-offer-batch.test.ts`
 
-Tree: leaf 0 Fill `[arkd, emu⊕fill]`, leaf 1 Owner `[maker, arkd]`, leaf 2 Exit `maker + CSV 1536 s`.
-Quote: 148 bytes, `maker_pubkey(32) ‖ epoch(8) ‖ sell_asset(34) ‖ buy_asset(34) ‖ rate_num(8) ‖
-rate_den(8) ‖ floor(8) ‖ min_fill(8) ‖ expiry(8)`, integers u64 LE < 2^63 (so `BIN2NUM` reads
-them positive), asset ids as the SDK serializes them (txid ‖ u16 LE gidx), BTC = 34 zero bytes.
-Signature: BIP340 over `tagged_hash("striker/quote/v2", quote)`; the version is the tag. Witness:
-`[signature, quote]`. Fill script (644 B): offchain-only gate (`"type" INSPECTINTENTMESSAGE NOT
-VERIFY DROP`, see the emulator findings) → `tagged hash` rebuilt in-script (`<SHA256(tag)‖SHA256(tag)>
-SWAP CAT SHA256 <maker> CHECKSIGFROMSTACK VERIFY`) → `SIZE 148`, `maker_pubkey`, `epoch` byte-compared
-against constants baked into the script → `expiry BIN2NUM CHECKTIME NOT VERIFY` → `IF/ELSE` on
-`sell_asset == BTC` computing `sold`/`received` from `INSPECTINPUTVALUE`/`INSPECTOUTPUTVALUE` and
+Tree: leaf 0 Fill sell-BTC `[arkd, emu⊕fill₀]`, leaf 1 Fill sell-USD `[arkd, emu⊕fill₁]`, leaf 2 Owner
+`[maker, arkd]`, leaf 3 Exit `maker + CSV 1536 s`.
+Quote: 40 bytes, `rate_num(8) ‖ rate_den(8) ‖ floor(8) ‖ min_fill(8) ‖ expiry(8)`, u64 LE < 2^63 (so
+`BIN2NUM` reads them positive). Signature: BIP340 over `tagged_hash(tag, quote)` with
+`tag = "striker/quote/v2" ‖ maker(32) ‖ epoch(u64 LE) ‖ usd_asset(34, as the SDK serializes it: txid ‖
+u16 LE gidx) ‖ side(1)`: version, maker, epoch, asset and side are bound by the tag, so the message
+carries only the five numbers and each leaf's `SHA256(tag)` constant is what a wrong-epoch, wrong-asset or
+wrong-side quote fails against. Witness: `[signature, quote]`. Fill script (203 B per side):
+offchain-only gate (`"type" INSPECTINTENTMESSAGE NOT VERIFY DROP`, see the emulator findings) → tagged
+hash rebuilt in-script (`<SHA256(tag)> DUP CAT SWAP CAT SHA256 <maker> CHECKSIGFROMSTACK VERIFY`) →
+`SIZE 40 EQUALVERIFY` → `expiry BIN2NUM CHECKTIME NOT VERIFY` → the USD id (`txid gidx`) pushed once
+onto the altstack → `sold = sell_in − sell_out` from `INSPECTINPUTVALUE`/`INSPECTOUTPUTVALUE` or
 `INSPECTINASSETLOOKUP`/`INSPECTOUTASSETLOOKUP` at `PUSHCURRENTINPUTINDEX` (change at the output with
-the input's index) → floor on the sell-side change balance → `sold ≥ min_fill` → `received × rate_den ≥
-sold × rate_num` (BigNum `MUL`) → `<i> 5 <usd> 1 TUNNEL` (same script = same covenant and epoch; every
-non-USD asset preserved exactly).
+the input's index; the asset lookups copy the id back to the altstack with `2DUP TOALTSTACK TOALTSTACK`)
+→ `sell_out ≥ floor` → `sold ≥ min_fill` → `received = buy_out − buy_in` → `received × rate_den ≥ sold ×
+rate_num` (BigNum `MUL`, the quote consumed by the last two `SUBSTR`s so nothing is left to drop) →
+`<i> 5 <usd from altstack> 1 TUNNEL` (same script = same covenant, epoch and side set; every non-USD
+asset preserved exactly). The previous single two-direction leaf (644 B, 148-byte quote with
+`maker ‖ epoch ‖ sell_asset ‖ buy_asset` in the message and an `IF/ELSE` on `sell_asset == BTC`) is in
+git history before this change.
 
 - **Everything in §3/§4 works on the stack, both directions on one sats + USD VTXO,
   payments landing in the change.** Refusals carry distinct texts in the returned error: bad
-  signature → `signature verification failed`; wrong epoch → `OP_EQUALVERIFY failed`; expired,
-  underpaid by one unit, floor crossed, below `min_fill`, dust shifted → `OP_VERIFY failed`. Floor
-  holds across three chained partial fills and exactly onto the floor is allowed. Epoch bump =
-  Owner-leaf self-spend into the epoch+1 tree through arkd alone (no emulator); the old quotes then
-  fail `OP_EQUALVERIFY`, epoch+1 quotes fill. `refused()` checks the message is a covenant
+  signature, and a quote signed for another epoch, another USD asset or the other side → `signature
+  verification failed` (the tag binds them); expired, underpaid by one unit, floor crossed, below
+  `min_fill`, dust shifted → `OP_VERIFY failed`. The side binding matters: a genuine sell-USD quote
+  (`rate 1/100 000`) presented on the sell-BTC leaf would otherwise sell BTC for 1/100 000 of the
+  price. Floor holds across three chained partial fills and exactly onto the floor is allowed. Epoch
+  bump = Owner-leaf self-spend into the epoch+1 tree through arkd alone (no emulator); the old quotes
+  then fail the signature check, epoch+1 quotes fill. `refused()` checks the message is a covenant
   execution failure (`failed to execute arkade script`) and carries the expected opcode/reason, so
   a transport or arkd error can't masquerade as a covenant refusal.
 - **`INSPECT*ASSET*` want the asset txid byte-reversed** relative to `AssetId.txid` / the
@@ -100,15 +109,29 @@ non-USD asset preserved exactly).
   output 1 → `input 1: … OP_VERIFY failed`; (b) a decoy at output 1 with exactly a valid change's
   balances but the taker's script → `input 1: … does not preserve source script`,
   i.e. the TUNNEL script check is the last line of defence. Honest 2 makers + 2 takers (one
-  selling BTC, one selling USD) in one tx: ~9 900 WU.
-- **Size (arkd `maxTxWeight` 40 000, `txFeeRate` 0):** 1 maker + 1 taker fill 5 106–5 158 WU;
-  each extra plain-wallet taker **630 WU** (input + sig + output + packet entries); each extra
-  maker **4 090 WU** (644 B script + 212 B witness in the OP_RETURN at 4 WU/B, plus input and
-  change). Measured: **1 maker + 56 takers** accepted (39 760 WU), 57 refused `TX_TOO_LARGE`;
-  **9 makers + 1 taker** accepted (37 834 WU), 10 refused. The emulator's CSFS budget (50/input,
-  200/request) is not binding. To fit more makers: one-direction Fill leaves (half the script),
-  a 1-byte direction instead of two 34-byte asset ids, the USD id pushed once (it appears 5×);
-  ~300 B scripts give ~13 makers per tx.
+  selling BTC, one selling USD) in one tx: 5 510 WU (was ~9 900).
+- **Size (arkd `maxTxWeight` 40 000, `txFeeRate` 0):** 1 maker + 1 taker fill 2 902–2 954 WU
+  (was 5 106–5 158); each extra plain-wallet taker **630 WU** (input + sig + output + packet
+  entries); each extra maker **1 886 WU** (was 4 090: 203 B script + 104 B witness in the
+  OP_RETURN at 4 WU/B, plus input and change). Measured to arkd's refusal: **1 maker + 59 takers**
+  accepted (39 446 WU), 60 refused `TX_TOO_LARGE` (was 56/57); **20 makers + 1 taker** accepted
+  (38 748 WU), 21 refused (was 9/10). The emulator's CSFS budget (50/input, 200/request) and its
+  64 intent-gated inputs per request are not binding. The shrink came from: one leaf per side (no
+  `IF/ELSE`, no second direction's arithmetic; the emulator packet carries only the executed
+  leaf's script, and the 4-leaf tree costs no extra control-block bytes over the 3-leaf one);
+  maker, epoch, asset and side moved from the message into the signature tag (−108 quote bytes,
+  −3 byte-compares against baked constants); `SHA256(tag)` pushed once and doubled with `DUP CAT`
+  (−30 B); the USD id pushed once and kept on the altstack (−3 × 34 B); the rate check consuming
+  the quote so no `2DROP DROP`. Rejected: u32 `expiry`/`epoch` (16 WU per maker; expiry would
+  read negative from 2038), u32 rate/amount fields (caps rates for other asset decimals), passing
+  the quote as separate witness items (the taker could re-split the signed bytes unless every
+  field's `SIZE` is checked, which costs more than the `SUBSTR`s), signing the raw `SHA256(tag) ‖
+  quote` without the outer hash (saves 3 B, leaves the BIP340 tagged-hash convention), dropping the
+  `SIZE 40` check (saves 5 B; trailing signed bytes would be harmless but the format would not be
+  strict). Fill latency measured in `10-offer.test.ts` (emulator `submitTx` alone, after
+  `attachPrevArkTxs`): p50 ~80 ms, p95 ~90 ms for a 2-input fill with an asset packet, with the
+  asset-claims suite running on the same stack; the ~30 ms figure in the emulator findings is a
+  single-input self-spend.
 - **Plain wallet takers:** `identity.sign(arkTx, [i])` + `identity.sign(checkpoint_i, [0])`
   before `emulator.submitTx`, input leaf = the coin's `forfeitTapLeafScript`. `attachPrevArkTxs`
   takes one txid *per input* (positional), not a set.
@@ -123,14 +146,13 @@ non-USD asset preserved exactly).
   shortfall), reuse one demo USD across runs (`demoUsd`) and reclaim every leftover offer VTXO
   through the Owner leaf at start (`sweepOffer`, 30 inputs per tx) — which doubles as the Owner
   withdraw test. Refilling the faucet needs an on-chain `faucet` + `ark settle` batch round.
-- **For DESIGN.md:** (1) §3: put `version` in the signature tag; `maker_pubkey` in the message is
-  redundant with the key in the script (kept here, could go). (2) §3/§4: the covenant is per
-  asset pair anyway, so a direction byte beats two asset ids, or split Fill into a sell-BTC and a
-  sell-USD leaf. (3) §4: "other balances ≥ input" → "preserved exactly" (`OP_TUNNEL` with the
-  traded token excepted). (4) §4: `floor` on the sats side must be ≥ dust or the change can't
-  exist; `min_fill` must be > 0 (sold = 0 would let anyone re-chain the VTXO for free).
-  (5) §4: the Fill leaf needs the offchain-only gate from the emulator findings. (6) §7: with the
-  current script "several makers" means ≤ 9 per tx, "many takers" ≈ 56.
+- **For DESIGN.md (all folded in):** (1) §3: version, maker, epoch, asset and side live in the
+  signature tag; the message is the five numbers. (2) §4: one Fill leaf per side. (3) §4: "other
+  balances ≥ input" → "preserved exactly" (`OP_TUNNEL` with the traded token excepted). (4) §4:
+  `floor` on the sats side must be ≥ dust or the change can't exist; `min_fill` must be > 0
+  (sold = 0 would let anyone re-chain the VTXO for free). (5) §4: the Fill leaf needs the
+  offchain-only gate from the emulator findings. (6) §7: "several makers" means ≤ 20 per tx,
+  "many takers" ≤ 59.
 
 ### Swap covenant + taker dust (§13 items 7, 8) — `swap.ts`, `20-swap.test.ts`
 
@@ -247,8 +269,8 @@ re-running the script).
   signed, `service.go:1101`):** 1 covenant input → **228** outputs (39 844 WU). Trivial
   covenant inputs → 1 output: **85** inputs (39 964 WU, ~470 WU/input, emulator 0.9 s).
   Arkade scripts and witnesses travel in the OP_RETURN emulator packet, so they cost 4 WU/byte.
-  A 300-byte fill script plus a ~150-byte quote witness costs ≈ 1 800 WU on top, which means
-  roughly 15–17 maker inputs per tx.
+  The 203-byte offer Fill leaf plus its 104-byte witness costs ≈ 1 230 WU on top, which comes to
+  1 886 WU per maker input and 20 maker inputs per tx (measured in `10-offer-batch.test.ts`).
 - **Emulator compute limits are per input and per request** (`pkg/arkade/compute_limits.go`):
   per input `CHECKSIG*`/`CHECKSIGFROMSTACK` 50, `INSPECTINTENTMESSAGE` 16, `ECMUL` 50, etc.,
   and ×4 per request (`requestInputBudget`). Measured: a tx can have at most **64**
@@ -332,3 +354,76 @@ emulator `test/delegate_test.go`): `PUSHEXPIRY <window> SUB CHECKTIME VERIFY`, t
   faucet's change), i.e. ~100 packages to exit. The test calls `wallet.settle()` first to get a
   batch leaf. For Striker this means: offer VTXOs that have been filled many times without a
   renewal are expensive to exit; renewal through a batch resets the depth to 1 (tree leaf).
+
+### Asset claims vs arkd (§14 open question) — `asset-claims.ts`, `50-asset-claims.test.ts`
+
+Question: covenants only see the tx's own asset packet (emulator `pkg/arkade/asset_opcodes.go:423-543`
+for `INSPECTINASSET*`, `tunnel.go:102-127` for `OP_TUNNEL`). Does arkd stop a tx from leaving an
+input's asset out of it? **Yes, in every variant.** `asset-claims.ts` builds offchain txs with the
+asset packet written out by hand. Each variant runs twice: a plain wallet input straight to arkd
+(`submitTx`, no emulator), and an accept-all covenant input (`[1]`) through the emulator, which
+co-signs and relays arkd's refusal. The two paths return identical texts. The emulator has no asset
+validation of its own (no `ValidateAssetTransaction` in its tree).
+
+| Variant | arkd v0.9.25 answer |
+|---|---|
+| (a) input holds A+B, packet lists only A | `ASSET_NOT_FOUND (34): input 0 owns asset <B> but it's not present in the packet` |
+| (b) asset input, no packet at all (plain offchain tx) | `ASSET_VALIDATION_FAILED (33): asset packet not found in tx <txid>` |
+| (c) packet present (only an issuance group), no group lists the input | `ASSET_NOT_FOUND (34): input 0 owns asset <B> but it's not present in the packet` |
+| (c′) B's group exists but lists only another input | `ASSET_INPUT_INVALID (35): input 0 owns asset <B> but it's not present in the asset group inputs` |
+| (d) declared 1 001, held 1 000 | `ASSET_INPUT_INVALID (35): input 0 owns asset <A> but amount mismatch: 1001 != 1000` |
+| (d′) claim on an input holding no assets | `ASSET_INPUT_INVALID (35): asset input 1 references input 1 which does not contain any assets` |
+| (d′) claim of A on an input holding only B | `ASSET_INPUT_INVALID (35): asset input 0 references input with asset <A> but asset not found in tx input 0` |
+| (e) outputs declare more than the inputs | reissuance: `CONTROL_ASSET_INVALID (37): asset <A> does not have a control asset` |
+| (e) outputs declare less than the inputs, or a group has no outputs | **accepted, the rest is burned.** Output got 400 of 1 000 A and none of 2 000 B |
+
+Source (arkd tag v0.9.25, `97386cb`; the emulator's `go.mod` pins ark-lib to the same commit, so
+both sides parse the packet identically):
+- `internal/core/application/service.go:823-826`: an input's held assets come from arkd's own
+  VTXO record (`vtxo.Assets`), not from the PSBT. `:1110` validates offchain txs, `:2458` intent
+  proofs (the inputs are shifted by the toSpend input, `:2124`, `:2226`).
+- `pkg/ark-lib/asset/tx_validation.go`: `:38` no packet while spending asset VTXOs. `:201-238`
+  `validateInputAssets`: every held asset must have a group (`:204`), that group must list the
+  input (`:228`), and the amount must be equal (`:218`). `:297-364` `validateGroupInputs`, the
+  reverse direction: every group input must hold assets (`:321`) and that asset (`:351`) at
+  exactly that amount (`:336`). Intent-type inputs are refused offchain (`:305`). There is **no**
+  sum(in) = sum(out) check. `asset_group.go:79-92` treats sum(out) > sum(in) as a reissuance
+  (`tx_validation.go:91` requires the control asset in the packet), and sum(out) < sum(in) is
+  simply allowed.
+- `packet.go:94-100`: one group per asset id. `asset_input.go:223-230` and `asset_output.go:191-197`:
+  unique vin / vout within a group. A packet therefore can't count one holding twice.
+- `internal/core/application/utils.go:343-370`: output VTXOs get exactly the declared group
+  outputs. There is no implicit carry-over. An asset left off every output is gone (burned),
+  never silently carried.
+
+**Soundness.** Together these mean that in any tx arkd accepts, the packet's claims for input i
+are *exactly* the assets VTXO i holds: same set, same amounts. Output j holds exactly what the
+packet declares for j. Packet-local introspection is therefore ground truth once arkd has accepted.
+- **Swap BTC-sell "no assets on the deposit" (`INSPECTINASSETCOUNT == 0`): sound.** A deposit of
+  20 000 sats + 500 B into a BTC→A swap: the honest packet (B declared) is refused by the covenant
+  (`OP_VERIFY failed`). The attack, leaving B out so the count reads 0, passes the covenant and the
+  emulator co-signs it. arkd then rejects it with `ASSET_NOT_FOUND (34): input 0 owns asset <B> but
+  it's not present in the packet`. A pure-sats deposit of the same swap fills. The dirty deposit
+  refunds after the deadline via refund-anyone with its 500 B intact. The token-sell path's
+  `INSPECTINASSETCOUNT == 1` + `INSPECTINASSETLOOKUP` rests on the same rules.
+- **Offer "other assets preserved" (`<i> 5 <A> 1 TUNNEL`): sound.** It was tested as the bare
+  clause (`tunnelExcept`), not `offer.ts`. Moving declared B to a taker is refused by the covenant
+  (`selected output does not preserve source assets`). Burning B by omitting it on both sides passes
+  `TUNNEL` (0 = 0) and is rejected by arkd (`ASSET_NOT_FOUND (34)`). Stealing B (omitted on the input,
+  declared on the taker's output) passes `TUNNEL` and is rejected by arkd with `ASSET_INPUT_INVALID (35):
+  … not present in the asset group inputs`. It would also need the control asset (sum(out) > sum(in)).
+  A self-spend that keeps B and changes A is accepted.
+- No failing attack exists, so no covenant change is needed. The residual dependency is unchanged
+  (DESIGN §10): conservation is arkd's check, not the emulator's. An arkd that skipped it could
+  burn or re-assign assets in its own index, but assets are an arkd-index concept to begin with.
+- Side note for builders: burns are free and silent. A tx that under-declares outputs loses the
+  difference, with no error. The spike's `buildTx` / `split` derive the change remainder
+  explicitly; Striker's tx builders must too.
+
+## Regtest housekeeping
+
+- The harness refills the regtest CLI faucet (on-chain faucet → boarding → `ark settle`) when
+  `ark send` would run dry.
+- The L1 exit test advances chain time by ~27 min per run (CSV 1536 s). bitcoind rejects blocks
+  more than 2 h ahead of its clock, so many back-to-back runs stall mining. `advanceMedianTime`
+  now fails fast with the wait time; `npm run regtest -- clean` followed by `start` resets it.

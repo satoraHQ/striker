@@ -331,7 +331,15 @@ export async function fillMany(chain: Chain, orders: Order[], maker: TestWallet,
   const outs: (Out | undefined)[] = orders.map(o => o.plan.receive);
   orders.forEach((o, i) => { if (o.plan.refund) outs[i + n] = o.plan.refund; });
   const rest = [makerOut, ...new Set(orders.flatMap(o => o.plan.fee ? [o.plan.fee] : []))];
-  for (let i = 0; rest.length; i++) if (!outs[i]) outs[i] = rest.shift();
+  // Free slots take the fees and maker change first; any remaining gap before a refund
+  // index (several maker coins push refunds further out) gets a dust output carved
+  // from the maker's change.
+  const pad = (): Out => {
+    if (makerOut.amount - chain.dust < chain.dust) throw new Error('Maker change too small to pad outputs');
+    makerOut.amount -= chain.dust;
+    return { script: maker.pkScript, amount: chain.dust };
+  };
+  for (let i = 0; rest.length || i < outs.length; i++) if (!outs[i]) outs[i] = rest.shift() ?? pad();
   if (outs.some(o => !o) || outs.length !== new Set(outs).size) throw new Error('Refund index beyond the outputs; add padding');
   const final = layout ? layout(outs as Out[]) : outs as Out[];
   const spends = [

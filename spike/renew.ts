@@ -200,7 +200,13 @@ export function exitSpend(tree: VtxoScript, coin: { txid: string; vout: number; 
  */
 export function advanceMedianTime(seconds: number) {
   const info = JSON.parse(regtest('rpc', 'getblockchaininfo')) as { mediantime: number };
-  const target = Math.max(info.mediantime, Math.floor(Date.now() / 1000)) + seconds;
+  const now = Math.floor(Date.now() / 1000);
+  const target = Math.max(info.mediantime, now) + seconds;
+  // bitcoind rejects blocks more than 2 h ahead of its clock. Each run moves the chain
+  // forward by `seconds`, so back-to-back runs eventually stall mining until the wall
+  // clock catches up.
+  if (target - now > 7_000) throw new Error(`Regtest chain time is ${info.mediantime - now} s ahead of the wall clock; ` +
+    `advancing another ${seconds} s would exceed bitcoind's 2 h future limit. Wait ${target - now - 7_000} s and rerun.`);
   try { regtest('rpc', 'setmocktime', String(target)); regtest('mine', '12'); }
   finally { regtest('rpc', 'setmocktime', '0'); }
   return target;
