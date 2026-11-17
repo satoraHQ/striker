@@ -200,7 +200,7 @@ it out (§4).
   packet at 4 WU/byte), each plain-wallet taker ≈ 630 WU. A smaller Fill script raises the
   maker count. The emulator also caps a request at 64 intent-gated inputs and 200
   `OP_CHECKSIGFROMSTACK` checks.
-- One emulator `SubmitTx` (script, sign, arkd submit and finalize) takes p50 15–25 ms, flat
+- One emulator `SubmitTx` (script, sign, arkd submit and finalize) takes p50 ~30 ms (p95 ~34 ms) on arkd v0.9.25, flat
   with chain depth.
 - When a maker VTXO is spent by a competing transaction, the single-spend rule rejects the
   loser. Striker re-sweeps and retries.
