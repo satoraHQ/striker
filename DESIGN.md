@@ -220,7 +220,7 @@ it out (§4).
   and that column has no index, so every lookup scans and parses the whole table (~9 µs per event,
   3 events per tx, about one lookup per event). At 1 461 events a lookup took 13.4 ms; with an
   expression index on `(payload->>'Id')` it took 0.12 ms. Latency therefore grows linearly with
-  arkd's lifetime tx count. This needs raising upstream before mainnet volumes matter.
+  arkd's lifetime tx count on the regtest stack.
 - When a maker VTXO is spent by a competing transaction, the single-spend rule rejects the
   loser. Striker re-sweeps and retries.
 - Chained fills inherit the inputs' earliest VTXO expiry. Renewal is covered in §8.
