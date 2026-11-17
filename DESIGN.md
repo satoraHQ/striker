@@ -215,12 +215,7 @@ it out (§4).
 - One emulator `SubmitTx` (script, sign, arkd submit and finalize) takes p50 22–30 ms (p95 25–34 ms)
   for a single-input self-spend on a fresh arkd v0.9.25 stack, flat with chain depth. On a stack
   with many earlier runs it rose to p50 ~60–80 ms. A 1 maker + 1 taker fill with an asset packet
-  measured p50 ~80 ms on such a stack. The cause is arkd's postgres event store: it loads an
-  off-chain tx's events with `SELECT payload FROM watermill_offchain_tx WHERE payload->>'Id' = $1`,
-  and that column has no index, so every lookup scans and parses the whole table (~9 µs per event,
-  3 events per tx, about one lookup per event). At 1 461 events a lookup took 13.4 ms; with an
-  expression index on `(payload->>'Id')` it took 0.12 ms. Latency therefore grows linearly with
-  arkd's lifetime tx count on the regtest stack.
+  measured p50 ~80 ms on such a stack.
 - When a maker VTXO is spent by a competing transaction, the single-spend rule rejects the
   loser. Striker re-sweeps and retries.
 - Chained fills inherit the inputs' earliest VTXO expiry. Renewal is covered in §8.
