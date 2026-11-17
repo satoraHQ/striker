@@ -1,0 +1,118 @@
+--- a/internal/application/service.go
++++ b/internal/application/service.go
+@@ -167,7 +167,9 @@
+ 
+ 	encodedCheckpoints := make([]string, 0, len(signed.Checkpoints))
+ 	for i, checkpoint := range signed.Checkpoints {
+-		encoded, err := checkpoint.B64Encode()
++		// Submit unsigned checkpoints, as the SDK does. Retain the verified
++		// client signatures locally and merge arkd's signatures for FinalizeTx.
++		encoded, err := checkpointForSubmission(checkpoint).B64Encode()
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to encode checkpoint %d: %w", i, err)
+ 		}
+@@ -210,10 +212,14 @@
+ 			return nil, fmt.Errorf("checkpoint %d has no inputs", i)
+ 		}
+ 
+-		checkpoint.Inputs[0].TaprootScriptSpendSig = append(
++		merged, err := mergeCheckpointSignatures(
+ 			checkpoint.Inputs[0].TaprootScriptSpendSig,
+-			arkdCheckpoint.Inputs[0].TaprootScriptSpendSig...,
++			arkdCheckpoint.Inputs[0].TaprootScriptSpendSig,
+ 		)
++		if err != nil {
++			return nil, fmt.Errorf("failed to merge checkpoint %d signatures: %w", i, err)
++		}
++		checkpoint.Inputs[0].TaprootScriptSpendSig = merged
+ 		encoded, err := checkpoint.B64Encode()
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to encode final checkpoint %d: %w", i, err)
+--- /dev/null
++++ b/internal/application/checkpoint_merge.go
+@@ -0,0 +1,44 @@
++package application
++
++import (
++	"bytes"
++	"fmt"
++	"github.com/btcsuite/btcd/psbt/v2"
++)
++
++// arkd may echo client signatures as well as adding its own. BIP371 identifies
++// a tapscript signature by (x-only public key, leaf hash); duplicate keys make
++// the PSBT invalid even when both signature values are identical.
++func mergeCheckpointSignatures(groups ...[]*psbt.TaprootScriptSpendSig) ([]*psbt.TaprootScriptSpendSig, error) {
++	merged := make([]*psbt.TaprootScriptSpendSig, 0)
++	for _, group := range groups {
++		for _, candidate := range group {
++			if candidate == nil {
++				return nil, fmt.Errorf("nil tapscript signature")
++			}
++			found := false
++			for _, prior := range merged {
++				if bytes.Equal(prior.XOnlyPubKey, candidate.XOnlyPubKey) && bytes.Equal(prior.LeafHash, candidate.LeafHash) {
++					if prior.SigHash != candidate.SigHash || !bytes.Equal(prior.Signature, candidate.Signature) {
++						return nil, fmt.Errorf("conflicting tapscript signatures for the same PSBT key")
++					}
++					found = true
++					break
++				}
++			}
++			if !found {
++				merged = append(merged, candidate)
++			}
++		}
++	}
++	return merged, nil
++}
++
++func checkpointForSubmission(checkpoint *psbt.Packet) *psbt.Packet {
++	copy := *checkpoint
++	copy.Inputs = append([]psbt.PInput(nil), checkpoint.Inputs...)
++	for i := range copy.Inputs {
++		copy.Inputs[i].TaprootScriptSpendSig = nil
++	}
++	return &copy
++}
+--- /dev/null
++++ b/internal/application/checkpoint_merge_test.go
+@@ -0,0 +1,38 @@
++package application
++
++import (
++	"bytes"
++	"github.com/btcsuite/btcd/btcec/v2"
++	"github.com/btcsuite/btcd/btcec/v2/schnorr"
++	"github.com/btcsuite/btcd/psbt/v2"
++	"github.com/btcsuite/btcd/wire/v2"
++	"github.com/stretchr/testify/require"
++	"strings"
++	"testing"
++)
++
++func TestMergeCheckpointSignatures(t *testing.T) {
++	sig := func(key, value byte) *psbt.TaprootScriptSpendSig {
++		_, pub := btcec.PrivKeyFromBytes(bytes.Repeat([]byte{key}, 32))
++		return &psbt.TaprootScriptSpendSig{XOnlyPubKey: schnorr.SerializePubKey(pub), LeafHash: bytes.Repeat([]byte{2}, 32), Signature: bytes.Repeat([]byte{value}, 64)}
++	}
++	client, echo, server := sig(1, 3), sig(1, 3), sig(4, 5)
++	merged, err := mergeCheckpointSignatures([]*psbt.TaprootScriptSpendSig{client}, []*psbt.TaprootScriptSpendSig{echo, server})
++	require.NoError(t, err)
++	require.Len(t, merged, 2)
++	tx := wire.NewMsgTx(2)
++	tx.AddTxIn(&wire.TxIn{})
++	tx.AddTxOut(&wire.TxOut{Value: 330, PkScript: []byte{0x51}})
++	packet, err := psbt.NewFromUnsignedTx(tx)
++	require.NoError(t, err)
++	packet.Inputs[0].TaprootScriptSpendSig = merged
++	submitted := checkpointForSubmission(packet)
++	require.Empty(t, submitted.Inputs[0].TaprootScriptSpendSig)
++	require.Len(t, packet.Inputs[0].TaprootScriptSpendSig, 2, "submission must preserve the signatures needed for finalization")
++	encoded, err := packet.B64Encode()
++	require.NoError(t, err)
++	_, err = psbt.NewFromRawBytes(strings.NewReader(encoded), true)
++	require.NoError(t, err, "final checkpoint must parse without duplicate PSBT keys")
++	_, err = mergeCheckpointSignatures([]*psbt.TaprootScriptSpendSig{client}, []*psbt.TaprootScriptSpendSig{sig(1, 9)})
++	require.ErrorContains(t, err, "conflicting")
++}
