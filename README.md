@@ -1,6 +1,6 @@
 # Striker
 
-Starting over: the design is being re-planned from scratch.
+Starting over: see [DESIGN.md](./DESIGN.md) for the v2 design and spike plan.
 
 The first TypeScript PoC (intent-based RFQ swaps on Arkade with recursive maker
 covenants, maker/taker/striker services and a web app) is archived at the
