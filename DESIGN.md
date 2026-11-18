@@ -185,8 +185,12 @@ Parameters: `receive_address`, `refund_address`, `fee_address`, `sell_asset`, `b
 - A fee below 330 sats must go to the fee key's `OP_RETURN <key>` sub-dust form; arkd
   rejects other outputs below dust.
 - Exact-out fixes `max_spend = floor(want / min_rate)` (rounded in the user's favour, fee
-  included on the BTC side) and the fee in the script. Every unspent sat goes back; a
-  remainder below dust as the refund key's `OP_RETURN <key>` sub-dust output.
+  included on the BTC side) and the fee in the script. Every unspent sat goes back on a
+  normal refund output; below dust the maker tops it up to dust (at most 329 sats, priced into
+  its quote). A sub-dust `OP_RETURN` refund would not be reliably spendable: arkd's
+  `VTXO_MIN_AMOUNT` defaults to dust, a tx may carry only three `OP_RETURN` outputs (the
+  extension included), and recovering sub-dust costs fees. Sub-dust *fee* outputs share that
+  limit, so Striker pays itself one fee output per fill tx.
   A deposit below `max_spend` only fills if a maker accepts the better rate; otherwise it refunds
   after the deadline.
 

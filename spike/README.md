@@ -247,14 +247,16 @@ re-running the script).
   intent proof is vulnerable: offer Fill, swap Fill. A held proof can also lock the VTXO
   into a batch, since arkd refuses offchain spends of registered VTXOs (`VTXO_ALREADY_REGISTERED`).
 - **Fix (tested): make Fill leaves offchain-only.** Prefix the script with
-  `"type" OP_INSPECTINTENTMESSAGE OP_NOT OP_VERIFY OP_DROP`. A miss pushes `[<> , 0]`
-  (`pkg/arkade/intent_message.go:99`), so the prefix passes offchain and fails on any intent.
-  The emulator then refuses to sign an intent even before expiry, and offchain fills still
-  work. This is the inverse of the Renew leaf's gate. `OP_INSPECTVERSION` is not a
-  substitute: arkd's `intent.Verify` doesn't check the proof's tx version.
-- **`SubmitOnchainTx`** (`pkg/emulator/onchain.go:16`) also returns a signed PSBT without
-  broadcasting it. Our covenant leaves include arkd's key, and arkd co-signs only through its
-  offchain and batch flows, so this is not a usable path for them.
+  `OP_PUSHEXPIRY OP_DROP "type" OP_INSPECTINTENTMESSAGE OP_NOT OP_VERIFY OP_DROP`. The intent
+  check alone is **not enough** (first version of this fix): a miss pushes `[<> , 0]`
+  (`pkg/arkade/intent_message.go:99`), so it passes offchain and fails on any intent, but
+  `SubmitOnchainTx` also runs scripts without an intent message and returns its signature. It
+  checks prevout txs only by hash, so a batch-intent proof, with its synthetic BIP322 `toSpend`
+  prevout, passes as an on-chain tx (`30-emulator-late` settles such a held proof after expiry;
+  arkd's key in the leaf doesn't help, since arkd co-signs the batch). `OP_PUSHEXPIRY` closes
+  that path: only `SubmitTx` and `SubmitIntent` pass the VTXO expiry (`WithExpiry`), so it fails
+  on-chain with "expiry not set". `OP_INSPECTVERSION` is not a substitute: arkd's
+  `intent.Verify` doesn't check the proof's tx version.
 - **Chain depth: no limit.** 1000 chained covenant self-spends (VTXO → tx1 → … → tx1000, no
   batch) were all accepted. The tip stays `preconfirmed`. arkd tracks `Depth` only to place DAG
   markers every 100 (`internal/core/domain/marker.go:7`, `application/service.go:1133-1158`).
@@ -455,7 +457,9 @@ A follow-up review of these fixes (Codex GPT-6.1 Terra) found:
   (`OP_PUSHEXPIRY expiry not set`). All offer and swap Fill leaves and the swap Refund-anyone
   leaf use it; `10-offer` and `20-swap` check the on-chain endpoint too.
 - **A sub-dust exact-out remainder was forfeited**, breaking the net `min_rate` on small
-  orders. Every unspent sat now returns, below dust as the refund key's `OP_RETURN` output.
+  orders. Every unspent sat now returns on a normal refund output; below dust the maker tops it
+  up to dust (a sub-dust `OP_RETURN` refund would hit arkd's `VTXO_MIN_AMOUNT`, its limit of
+  three `OP_RETURN` outputs per tx, and recovery fees; third review).
 - **`floor` = `00…00 80` (negative zero) read as 0.** The floor is checked by its top byte.
 - **`planFill` kept exact-out price improvement from the user**; the unsold tokens now come back.
 

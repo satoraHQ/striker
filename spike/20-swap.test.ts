@@ -123,16 +123,18 @@ test('swap covenant (DESIGN §5) and taker dust (§6)', { timeout: 900_000 }, as
     assert.equal(usdOf(change, usd), U - sold);
   });
 
-  await t.test('exact-out BTC→USD: a sub-dust remainder returns as the refund key\'s OP_RETURN output', async () => {
+  await t.test('exact-out BTC→USD: a sub-dust remainder comes back, topped up to dust by the maker', async () => {
     const want = 500n * 100_000_000n;                 // max spend 500 000 sats
     const swap = swapCovenant(chain, terms({ exactOut: want }));
     const coin = await deposit(chain, user, swap, Number(D) + 500_100);   // 100 sats over: below dust
     const plan = planFill(swap, coin);
-    assert.equal(plan.refund!.amount, 100n);
+    assert.equal(plan.refund!.amount, D, 'a spendable refund output, not a sub-dust OP_RETURN one');
     const { refund: _, ...kept } = plan;               // forfeiting the remainder to the maker is refused
     await refused(() => fill(chain, swap, coin, maker, kept));
     const { txid } = await fill(chain, swap, coin, maker, plan);
-    assert.equal(BigInt((await outputAt(chain, txid, 2)).value), 100n);
+    const refund = await outputAt(chain, txid, 2);
+    assert.equal(refund.script, Buffer.from(user.pkScript).toString('hex'));
+    assert.equal(BigInt(refund.value), D);
   });
 
   await t.test('deadline: refund-anyone refused before, fill refused after, refund-anyone after', async () => {

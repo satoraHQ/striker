@@ -62,12 +62,6 @@ const pays = (idx: Ops, script: Uint8Array): Ops => [...idx, 'INSPECTOUTPUTSCRIP
 /** arkd only accepts outputs below dust as `OP_RETURN <taproot key>` ("subdust" VTXOs,
  * recoverable by the key holder in a batch). Fees can be tiny, so accept both forms. */
 export const subdustScript = (p2tr: Uint8Array) => Uint8Array.from([0x6a, 0x20, ...program(p2tr)]);
-/** Output at the index on the stack pays `script`'s key, as P2TR or (below dust) its sub-dust form; keeps the index. */
-const paysEither = (script: Uint8Array): Ops => [
-  'DUP', 'INSPECTOUTPUTSCRIPTPUBKEY', 'DUP', 1, 'EQUAL',
-  'IF', 'DROP', program(script), 'EQUALVERIFY',
-  'ELSE', -1, 'EQUALVERIFY', sha256(subdustScript(script)), 'EQUALVERIFY', 'ENDIF',
-];
 const paysFee = (script: Uint8Array): Ops => [
   'DUP', 'INSPECTOUTPUTSCRIPTPUBKEY', 'DUP', 1, 'EQUAL',
   'IF', 'DROP', program(script), 'EQUALVERIFY',
@@ -151,8 +145,8 @@ export function fillScript(t: SwapTerms): Uint8Array {
       CUR, ...buy, 'INSPECTOUTASSETLOOKUP', 'DROP', t.exactOut, 'GREATERTHANOREQUAL', 'VERIFY',
       CUR, 'INSPECTINPUTVALUE', D + c.maxSpend!, 'SUB',                // R = unused sats
       'DUP', 0, 'GREATERTHAN',
-      'IF',                                                            // any R goes back; below dust as OP_RETURN <key>
-        ...refundIdx, ...paysEither(t.refund),
+      'IF',                                                            // any R goes back on a normal output (≥ dust:
+        ...refundIdx, ...pays(['DUP'], t.refund),                      //  below dust the maker tops it up)
         'INSPECTOUTPUTVALUE', 'LESSTHANOREQUAL', 'NOTIF', 'RETURN', 'ENDIF',
       'ELSE', 'DROP', 'ENDIF',
       c.fee!, ...tail,
@@ -307,9 +301,9 @@ export function planFill(swap: Swap, coin: CoinLike, rate = swap.terms.rate): Fi
     }
     const spend = t.exactOut * rate.den / rate.num, R = S - D - spend;   // spend ≤ maxSpend, fee included
     if (R < 0n) throw new Error('Deposit too small for the exact-out amount');
-    // Every unspent sat goes back: below dust as the refund key's sub-dust (OP_RETURN) output.
+    // Every unspent sat goes back on a spendable output; the maker tops a sub-dust remainder up to dust.
     return { receive: { script: t.receive, amount: D, assets: { [t.buy]: t.exactOut } }, fee: fee(c.fee!),
-      ...(R > 0n ? { refund: { script: R < D ? subdustScript(t.refund) : t.refund, amount: R } } : {}) };
+      ...(R > 0n ? { refund: { script: t.refund, amount: R < D ? D : R } } : {}) };
   }
   const U = assetsOf(coin)[t.sell] ?? 0n;
   if (t.exactOut === undefined)
