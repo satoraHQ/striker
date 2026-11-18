@@ -1,7 +1,7 @@
 // Renew leaf (DESIGN.md §8): batch registration only, Striker the only cosigner, the paired
 // proof output keeps script, value and assets. Proven in spike/40-renew.
 import { arkade, MultisigTapscript } from '@arkade-os/sdk';
-import type { ChainParams } from './chain.js';
+import type { CovenantParams } from './chain.js';
 import { utf8 } from './util.js';
 
 /** OP_TUNNEL flag bits (emulator README): 1 scriptPubKey, 2 value, 4 assets. */
@@ -38,6 +38,6 @@ export function renewScript({ cosigner, window, maxFee }: RenewParams): Uint8Arr
 }
 
 /** `[striker, server, emulator ⊕ renewScript]`. */
-export function renewLeaf(chain: ChainParams, params: RenewParams, script = renewScript(params)) {
+export function renewLeaf(chain: CovenantParams, params: RenewParams, script = renewScript(params)) {
   return MultisigTapscript.encode({ pubkeys: [params.delegateKey, chain.server, arkade.computeArkadeScriptPublicKey(chain.emulatorKey, script)] }).script;
 }

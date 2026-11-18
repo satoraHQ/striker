@@ -1,0 +1,13 @@
+{
+  "name": "@striker/maker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --import tsx src/main.ts"
+  },
+  "dependencies": {
+    "@arkade-os/sdk": "0.5.6",
+    "@striker/core": "*"
+  }
+}

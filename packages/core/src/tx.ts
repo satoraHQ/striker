@@ -1,11 +1,11 @@
 // Offchain tx builder mixing covenant inputs (Arkade script + witness, co-signed by the
 // emulator) and plain inputs (signed by an identity), with the asset packet derived from the
 // declared input and output balances.
-import { asset, attachPrevArkTxs, buildOffchainTx, EmulatorPacket, Extension, Transaction,
-  type ArkTxInput, type Identity, type IndexerProvider, type EmulatorProvider, type TapLeafScript, type VirtualCoin } from '@arkade-os/sdk';
+import { asset, attachPrevArkTxs, buildOffchainTx, combineTapscriptSigs, EmulatorPacket, Extension, matchServerCheckpoints, Transaction,
+  type ArkProvider, type ArkTxInput, type Identity, type IndexerProvider, type EmulatorProvider, type TapLeafScript, type VirtualCoin } from '@arkade-os/sdk';
 import { RawWitness } from '@scure/btc-signer';
 import type { ChainParams } from './chain.js';
-import { b64, unb64 } from './util.js';
+import { b64, hex, unb64 } from './util.js';
 
 export interface AssetAmount { assetId: string; amount: bigint }
 export interface Coin extends Pick<VirtualCoin, 'txid' | 'vout' | 'value'> { assets?: { assetId: string; amount: string | number | bigint }[] }
@@ -58,4 +58,18 @@ export async function submitViaEmulator(emulator: EmulatorProvider, indexer: Ind
   const result = await emulator.submitTx(b64(built.arkTx.toPSBT()), built.checkpoints.map(c => b64(c.toPSBT())));
   const signed = Transaction.fromPSBT(unb64(result.signedArkTx));
   return { txid: signed.id, signedArkTx: result.signedArkTx };
+}
+
+/**
+ * Plain arkd path for txs without covenant inputs (owner leaf, wallet inputs): the checkpoints
+ * already carry every non-arkd signature. arkd ≥ 0.9.22 finalizes inside `submitTx` and echoes the
+ * signatures back; only when it did not are the signatures merged and `finalizeTx` called.
+ */
+export async function submitViaArkd(ark: ArkProvider, built: BuiltTx) {
+  const res = await ark.submitTx(b64(built.arkTx.toPSBT()), built.checkpoints.map(c => b64(c.toPSBT())));
+  const matched = matchServerCheckpoints(res.signedCheckpointTxs, built.checkpoints, 'submitTx');
+  const sigs = (t: Transaction) => (t.getInput(0).tapScriptSig ?? []).map(([k, s]) => hex(k.pubKey) + hex(k.leafHash) + hex(s));
+  const finalized = matched.every(({ server, local }) => { const have = new Set(sigs(server)); return sigs(local).every(e => have.has(e)); });
+  if (!finalized) await ark.finalizeTx(res.arkTxid, matched.map(({ server, local }) => b64(combineTapscriptSigs(local, server).toPSBT())));
+  return { txid: res.arkTxid };
 }

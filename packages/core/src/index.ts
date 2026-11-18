@@ -8,3 +8,4 @@ export { BTC, SWAP_LEAF, constants, fillScript as swapFillScript, refundScript a
 export * from './tx.js';
 export * from './settle.js';
 export * from './pricing.js';
+export * from './api.js';

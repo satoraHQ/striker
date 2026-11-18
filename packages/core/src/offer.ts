@@ -5,7 +5,7 @@
 //   leaf 3  Owner             [maker, server]
 //   leaf 4  Exit (L1)         maker + CSV seconds
 import { arkade, VtxoScript } from '@arkade-os/sdk';
-import { addressOf, covenantLeaf, exitLeaf, ownerLeaf, type ChainParams } from './chain.js';
+import { addressOf, covenantLeaf, exitLeaf, ownerLeaf, type CovenantParams } from './chain.js';
 import { assetBytes, OFF, QUOTE_LENGTH, quoteTagHash, SELL_BTC, SELL_ASSET, type QuoteContext, type Side } from './quote.js';
 import { renewLeaf, renewScript, type RenewParams } from './renew.js';
 import { utf8 } from './util.js';
@@ -63,7 +63,7 @@ export interface Offer extends OfferParams {
   address: string;
 }
 
-export function offerCovenant(chain: ChainParams, p: OfferParams): Offer {
+export function offerCovenant(chain: CovenantParams, p: OfferParams): Offer {
   const fill: [Uint8Array, Uint8Array] = [fillScript(p, SELL_BTC), fillScript(p, SELL_ASSET)];
   const renew = renewScript(p.renew);
   const tree = new VtxoScript([

@@ -7,7 +7,7 @@
 // anywhere (its index is the only witness item).
 import { arkade, asset, MultisigTapscript, VtxoScript } from '@arkade-os/sdk';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { addressOf, covenantLeaf, exitLeaf, type ChainParams } from './chain.js';
+import { addressOf, covenantLeaf, exitLeaf, type CovenantParams } from './chain.js';
 import { offchainOnly } from './offer.js';
 import { feeOf, hex, unhex } from './util.js';
 
@@ -154,7 +154,7 @@ export function refundScript(t: SwapTerms): Uint8Array {
 export interface Swap { terms: SwapTerms; fill: Uint8Array; refund: Uint8Array; tree: VtxoScript; address: string }
 export const SWAP_LEAF = { fill: 0, refundAnyone: 1, refundKey: 2, exit: 3 } as const;
 
-export function swapCovenant(chain: ChainParams, terms: SwapTerms): Swap {
+export function swapCovenant(chain: CovenantParams, terms: SwapTerms): Swap {
   const fill = fillScript(terms), refund = refundScript(terms);
   const tree = new VtxoScript([
     covenantLeaf(chain, fill),
