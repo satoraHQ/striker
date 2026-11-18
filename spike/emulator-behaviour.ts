@@ -2,9 +2,11 @@
 // expiry scripts, single-input covenant spends, emulator-signed intents held
 // and settled later, and the non-finalizer offchain path.
 import {
-  arkade, Batch, buildOffchainTx, EmulatorPacket, Extension, MultisigTapscript,
-  networks, Proof, Transaction, VtxoScript, withPrevTxs, type Identity, type SignerSession, type VirtualCoin,
+  arkade, attachPrevoutTxs, Batch, buildOffchainTx, EmulatorPacket, Extension, MultisigTapscript,
+  networks, Proof, resolvePrevTxs, Transaction, VtxoScript, withPrevTxs, type Identity, type SignerSession, type VirtualCoin,
 } from '@arkade-os/sdk';
+import { Script } from '@scure/btc-signer';
+import { schnorr } from '@noble/curves/secp256k1.js';
 import type { TransactionOutput } from '@scure/btc-signer/psbt.js';
 import { RawWitness } from '@scure/btc-signer';
 import { asInput, b64, hex, submit, submitToArkd, unb64, type Chain } from './harness.js';
@@ -17,6 +19,12 @@ export const beforeExpiry = (expiry: number) => arkade.ArkadeScript.encode([expi
 export const beforeExpiryOffchainOnly = (expiry: number) => arkade.ArkadeScript.encode([
   new TextEncoder().encode('type'), 'INSPECTINTENTMESSAGE', 'NOT', 'VERIFY', 'DROP',
   expiry, 'CHECKTIME', 'NOT']);
+/** The gate DESIGN.md §2 settles on: `OP_PUSHEXPIRY OP_DROP` fails on the emulator's on-chain
+ * path (no VTXO expiry there: "OP_PUSHEXPIRY expiry not set"), the intent check fails on the
+ * batch-intent path, leaving only the one-shot offchain SubmitTx. */
+export const offchainOnlyGate = [
+  'PUSHEXPIRY', 'DROP', new TextEncoder().encode('type'), 'INSPECTINTENTMESSAGE', 'NOT', 'VERIFY', 'DROP'] as const;
+export const beforeExpiryGated = (expiry: number) => arkade.ArkadeScript.encode([...offchainOnlyGate, expiry, 'CHECKTIME', 'NOT']);
 /** Trivial covenant: output 0 carries ≥ 1 sat. */
 export const trivial = arkade.ArkadeScript.encode([0, 'INSPECTOUTPUTVALUE', 1, 'GREATERTHANOREQUAL']);
 
@@ -60,6 +68,33 @@ export async function emulatorSignedIntent(chain: Chain, coin: VirtualCoin, tree
   return { proof: await chain.emulator.submitIntent({ proof: b64(proof.toPSBT()), message }), message };
 }
 
+
+/**
+ * The same intent proof, but signed through the emulator's *on-chain* endpoint (SubmitOnchainTx).
+ * That path runs the script with no intent message (so an intent-only gate passes) and checks
+ * prevout txs only by hash, so the proof's synthetic BIP322 `toSpend` tx is accepted as a prevout.
+ * The returned proof carries the emulator's signatures and registers with arkd like any other.
+ */
+export async function onchainSignedIntent(chain: Chain, coin: VirtualCoin, tree: VtxoScript, script: Uint8Array,
+  outputs: TransactionOutput[], message: Proof.RegisterMessage) {
+  const leaf = leafOf(tree);
+  const [withPrev] = await withPrevTxs([{ ...coin, tapTree: tree.encode(), proofTapLeafScript: leaf, forfeitTapLeafScript: leaf }], chain.indexer);
+  // Both proof inputs (0 = toSpend, 1 = the coin) run the covenant, so the emulator signs both.
+  const packet = Extension.create([EmulatorPacket.create([0, 1].map(vin => ({ vin, script, witness: RawWitness.encode([]) })))]).txOut();
+  const proof = Proof.create(message, [withPrev!], [...outputs, packet]);
+  // Rebuild the BIP322 toSpend tx exactly as Proof.create does (TAG "ark-intent-proof-message").
+  const encoded = JSON.stringify({ type: 'register', onchain_output_indexes: message.onchain_output_indexes,
+    valid_at: message.valid_at, expire_at: message.expire_at, cosigners_public_keys: message.cosigners_public_keys });
+  const toSpend = new Transaction({ version: 0 });
+  toSpend.addInput({ txid: new Uint8Array(32), index: 0xffffffff, sequence: 0 });
+  toSpend.addOutput({ amount: 0n, script: tree.pkScript });
+  toSpend.updateInput(0, { finalScriptSig: Script.encode(['OP_0', schnorr.utils.taggedHash('ark-intent-proof-message', new TextEncoder().encode(encoded))]) });
+  if (toSpend.id !== hex(proof.getInput(0).txid!)) throw new Error('toSpend reconstruction does not match the proof');
+  const raw = new Map([[toSpend.id, toSpend.toBytes(true, false)], ...(await resolvePrevTxs([coin.txid], chain.indexer))]);
+  await attachPrevoutTxs(proof, { getRawTransaction: async txid => { const r = raw.get(txid); if (!r) throw new Error(`no raw tx ${txid}`); return r; } });
+  const { signedTx } = await chain.emulator.submitOnchainTx(b64(proof.toPSBT()));
+  return { proof: signedTx, message };
+}
 
 /** Registers an already-signed intent with arkd and drives it through a batch.
  * The emulator co-signs the forfeit in SubmitFinalization without re-running the script. */

@@ -3,8 +3,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { attachPrevArkTxs, Transaction } from '@arkade-os/sdk';
-import { b64, coinAt, coinsAt, connect, disposeWallets, refused, regtest, secret, submitBuilt, submitToArkd, unb64, waitFor, walletCoins } from './harness.js';
+import { attachPrevArkTxs, Transaction, type VirtualCoin } from '@arkade-os/sdk';
+import { onchainSignedIntent, registerMessage } from './emulator-behaviour.js';
+import { b64, coinAt, coinsAt, connect, disposeWallets, refused, regtest, rejectedWith, secret, submitBuilt, submitToArkd, unb64, waitFor, walletCoins } from './harness.js';
 import { schnorr } from '@noble/curves/secp256k1.js';
 import { OFF, SELL_BTC, SELL_USD, assetIdsOf, buildTx, demoUsd, encodeQuote, ensureFunded, sweepOffer, finalWeight, makerLeg, minReceived, offerTree, ownerInput, quoteHash, signQuote,
   usdOf, walletInput, type Coin, type FillPlan, type Offer, type Quote, type QuoteContext, type TxOutput } from './offer.js';
@@ -107,6 +108,18 @@ test('offer covenant: quotes, floor, epoch, two assets, dust', { timeout: 600_00
       const p = { ...plan(q, 10_000n, field === 'rateNum' ? { received: 0n } : {}), message, signature };
       await refusedFill(fill(p, await takerUsdCoin()), /OP_VERIFY failed/);
     }
+    // Negative zero: floor bytes 00…00 80 (2^63 unsigned) read as 0 after BIN2NUM. The top-byte check refuses it.
+    {
+      const message = encodeQuote(q);
+      message.fill(0, OFF.floor, OFF.floor + 8);
+      message[OFF.floor + 7] = 0x80;
+      const signature = schnorr.sign(quoteHash(offer, SELL_BTC, message), secret(20));
+      await refusedFill(fill({ ...plan(q, 10_000n), message, signature }, await takerUsdCoin()), /OP_VERIFY failed/);
+    }
+    // The fill leaf refuses the emulator's on-chain endpoint (no intent message there, so only
+    // OP_PUSHEXPIRY catches it): its signature could otherwise be registered after expiry.
+    await rejectedWith(/opcode=OP_PUSHEXPIRY .*expiry not set/, () => onchainSignedIntent(chain, coin as VirtualCoin, offer.tree, offer.fill[SELL_BTC],
+      [{ script: taker.pkScript, amount: BigInt(coin.value) }], registerMessage('02' + Buffer.from(taker.publicKey).toString('hex'))));
     // Underpayment by one unit is refused; the exact rounded-up amount fills.
     await refusedFill(fill(plan(q, 10_000n, { received: minReceived(q, 10_000n) - 1n }), await takerUsdCoin()), /OP_VERIFY failed/);
     const r = await settle(await fill(plan(q, 10_000n), await takerUsdCoin()));

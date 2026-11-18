@@ -12,8 +12,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { attachPrevArkTxs, Transaction, VtxoScript, type VirtualCoin } from '@arkade-os/sdk';
 import { addressOf, b64, coinAt, coinsAt, connect, covenantTree, disposeWallets, exitLeaf, fundedWallet, hex,
-  refused, unb64, waitFor, type Chain, type TestWallet } from './harness.js';
-import { beforeExpiry, beforeExpiryOffchainOnly, emulatorSignedIntent, registerMessage, settleIntent, spend, submitHeldToArkd, submitSpend,
+  refused, rejectedWith, unb64, waitFor, type Chain, type TestWallet } from './harness.js';
+import { beforeExpiry, beforeExpiryGated, beforeExpiryOffchainOnly, emulatorSignedIntent, onchainSignedIntent, registerMessage, settleIntent, spend, submitHeldToArkd, submitSpend,
   threeKeyLeaf } from './emulator-behaviour.js';
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -78,7 +78,7 @@ test('late submission: CHECKTIME expiry vs held emulator signatures', { timeout:
   assert.ok(!(await unspent(chain, tree, intentCoin)), 'expired covenant coin was spent by the held intent');
 });
 
-test('late submission fix: an intent gate makes the fill leaf offchain-only', { timeout: 180_000 }, async t => {
+test('late submission fix, part 1: an intent gate makes SubmitIntent refuse (not enough alone, see below)', { timeout: 180_000 }, async t => {
   t.after(disposeWallets);
   const chain = await connect();
   const carol = await fundedWallet(chain, 42, 100_000);
@@ -92,4 +92,36 @@ test('late submission fix: an intent gate makes the fill leaf offchain-only', { 
   await refused(() => emulatorSignedIntent(chain, a, tree, script, [{ script: carol.pkScript, amount: 9_800n }], message));
   // ... while offchain fills (which the emulator submits itself) still work.
   await submitSpend(chain, [{ coin: b, tree, script }], [{ script: carol.pkScript, amount: 10_000n }]);
+});
+
+test('late submission via the on-chain endpoint: an intent-only gate is not enough; OP_PUSHEXPIRY closes it', { timeout: 300_000 }, async t => {
+  t.after(disposeWallets);
+  const chain = await connect();
+  const dave = await fundedWallet(chain, 43, 100_000);
+  const session = dave.identity.signerSession();
+  const message = registerMessage(hex(await session.getPublicKey()));
+  const outs = [{ script: dave.pkScript, amount: 10_000n }];
+
+  // Intent-only gate (the first fix): SubmitIntent refuses, but SubmitOnchainTx signs the same
+  // proof before expiry, and the held proof settles in a batch after expiry.
+  const expiry = now() + 30;
+  const weak = beforeExpiryOffchainOnly(expiry);
+  const weakTree = covenantTree(chain, weak, [exitLeaf(dave.publicKey, 1536n)]);
+  const coin = await fund(chain, dave, weakTree, 10_000);
+  await refused(() => emulatorSignedIntent(chain, coin, weakTree, weak, outs, message));
+  const held = await onchainSignedIntent(chain, coin, weakTree, weak, outs, message);
+  t.diagnostic('SubmitOnchainTx co-signed the intent proof that SubmitIntent refused');
+  await new Promise(r => setTimeout(r, (expiry - now() + 2) * 1000));
+  const commitment = await settleIntent(chain, held, coin, weakTree, weak, session, [{ address: dave.address, amount: 10_000 }]);
+  t.diagnostic(`held on-chain-signed intent settled ${now() - expiry} s after expiry in ${commitment}`);
+  assert.ok(!(await unspent(chain, weakTree, coin)), 'the intent-only gate was bypassed');
+
+  // OP_PUSHEXPIRY gate: the on-chain endpoint has no VTXO expiry and refuses; intents refuse; offchain works.
+  const strong = beforeExpiryGated(now() + 3600);
+  const strongTree = covenantTree(chain, strong, [exitLeaf(dave.publicKey, 1536n)]);
+  const [a, b] = [await fund(chain, dave, strongTree, 10_000), await fund(chain, dave, strongTree, 10_000)];
+  const r = await rejectedWith(/OP_PUSHEXPIRY expiry not set/, () => onchainSignedIntent(chain, a, strongTree, strong, outs, message));
+  t.diagnostic(`on-chain endpoint with the PUSHEXPIRY gate: ${r.message.slice(0, 160)}`);
+  await refused(() => emulatorSignedIntent(chain, a, strongTree, strong, outs, message), /OP_VERIFY/);
+  await submitSpend(chain, [{ coin: b, tree: strongTree, script: strong }], [{ script: dave.pkScript, amount: 10_000n }]);
 });

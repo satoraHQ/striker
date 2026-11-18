@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { attachPrevArkTxs, Transaction, type VtxoScript } from '@arkade-os/sdk';
 import { addressOf, b64, coinAt, connect, covenantTree, disposeWallets, exitLeaf, fundedWallet, rejectionOf, unb64, type Chain } from './harness.js';
-import { beforeExpiryOffchainOnly, spend, trivial } from './emulator-behaviour.js';
+import { beforeExpiryGated, spend, trivial } from './emulator-behaviour.js';
 
 type Coin = { txid: string; vout: number; value: number };
 function finalWeight(signedArkTx: string) {
@@ -58,7 +58,7 @@ test('size: max outputs and covenant inputs per offchain tx', { timeout: 900_000
 
   // 3. Inputs gated with OP_INSPECTINTENTMESSAGE (the late-submission fix): the
   // emulator's request-wide budget allows 4 × 16 = 64 executions per tx.
-  const gatedScript = beforeExpiryOffchainOnly(Math.floor(Date.now() / 1000) + 3600);
+  const gatedScript = beforeExpiryGated(Math.floor(Date.now() / 1000) + 3600);
   const gated = covenantTree(chain, gatedScript, [exitLeaf(erin.publicKey, 1536n)]);
   const rest = { txid: out.txid, vout: 0, value: total - PIECE * (out.n - 1) };
   const GATED = 70;

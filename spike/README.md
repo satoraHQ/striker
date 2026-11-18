@@ -445,6 +445,20 @@ each asking whether anyone can make a maker or taker lose money. Fixed in this b
 - **The L1 exit did not show the asset** (Terra): the exit spend now carries the asset packet.
   How those units are used afterwards is open (DESIGN.md §14).
 
+A follow-up review of these fixes (Codex GPT-6.1 Terra) found:
+
+- **The intent-only gate could be bypassed through the emulator's on-chain endpoint.**
+  `SubmitOnchainTx` runs scripts without an intent message and checks prevouts only by hash, so
+  it signs a batch-intent proof (with its synthetic BIP322 prevout) that `SubmitIntent` refuses.
+  `30-emulator-late` settles such a held proof 3 s after expiry. The gate is now
+  `OP_PUSHEXPIRY OP_DROP` + the intent check: the on-chain path has no VTXO expiry
+  (`OP_PUSHEXPIRY expiry not set`). All offer and swap Fill leaves and the swap Refund-anyone
+  leaf use it; `10-offer` and `20-swap` check the on-chain endpoint too.
+- **A sub-dust exact-out remainder was forfeited**, breaking the net `min_rate` on small
+  orders. Every unspent sat now returns, below dust as the refund key's `OP_RETURN` output.
+- **`floor` = `00…00 80` (negative zero) read as 0.** The floor is checked by its top byte.
+- **`planFill` kept exact-out price improvement from the user**; the unsold tokens now come back.
+
 Documented rather than changed: the floor bounds one VTXO, not the offer (DESIGN.md §3); the
 real offer tree has no Renew leaf yet (prototype); the emulator operator's clock decides expiry; offline exit needs saved exit data (DESIGN.md §10).
 

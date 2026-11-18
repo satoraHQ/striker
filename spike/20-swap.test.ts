@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { connect, disposeWallets, fundedWallet, hex, issueDemoUsd, publicKey, refused, rejectedWith, secret } from './harness.js';
 import { SingleKey } from '@arkade-os/sdk';
-import { emulatorSignedIntent, registerMessage } from './emulator-behaviour.js';
+import { emulatorSignedIntent, onchainSignedIntent, registerMessage } from './emulator-behaviour.js';
 import { BTC, LEAF, deposit, fill, fillMany, num, outputAt, planFill, submitViaArkd, submitViaEmulator, swapCovenant, swapSpend, type SwapTerms } from './swap.js';
 
 // $100,000 / BTC with an 8-decimal USD: 1 sat = 100_000 USD base units.
@@ -123,6 +123,18 @@ test('swap covenant (DESIGN §5) and taker dust (§6)', { timeout: 900_000 }, as
     assert.equal(usdOf(change, usd), U - sold);
   });
 
+  await t.test('exact-out BTC→USD: a sub-dust remainder returns as the refund key\'s OP_RETURN output', async () => {
+    const want = 500n * 100_000_000n;                 // max spend 500 000 sats
+    const swap = swapCovenant(chain, terms({ exactOut: want }));
+    const coin = await deposit(chain, user, swap, Number(D) + 500_100);   // 100 sats over: below dust
+    const plan = planFill(swap, coin);
+    assert.equal(plan.refund!.amount, 100n);
+    const { refund: _, ...kept } = plan;               // forfeiting the remainder to the maker is refused
+    await refused(() => fill(chain, swap, coin, maker, kept));
+    const { txid } = await fill(chain, swap, coin, maker, plan);
+    assert.equal(BigInt((await outputAt(chain, txid, 2)).value), 100n);
+  });
+
   await t.test('deadline: refund-anyone refused before, fill refused after, refund-anyone after', async () => {
     const swap = swapCovenant(chain, terms({ sell: usd, buy: BTC, rate: USD_BTC, deadline: now() + 12n }));
     const U = 10n * 100_000_000n;
@@ -217,31 +229,37 @@ test('swap covenant (DESIGN §5) and taker dust (§6)', { timeout: 900_000 }, as
     assert.ok((await fill(chain, tok, coin, maker, p2)).txid);
   });
 
-  await t.test('exact-out USD→BTC at an improved rate with U = max spend: no token change', async () => {
-    // The covenant branches on U − maxSpend (here 0: no change output), not on what the filler sells.
+  await t.test('exact-out USD→BTC at an improved rate with U = max spend: the unsold tokens still come back', async () => {
+    // The covenant branches on U − maxSpend (here 0: it requires no change), not on what the filler sells.
     const want = 200_000n;
     const swap = swapCovenant(chain, terms({ sell: usd, buy: BTC, rate: USD_BTC, exactOut: want }));
     const U = want * 100_000n;                         // exactly maxSpend
     const coin = await deposit(chain, user, swap, Number(D), [{ assetId: usd, amount: U }]);
     const plan = planFill(swap, coin, { num: 101n, den: 10_000_000n });
-    assert.equal(plan.refund, undefined);
-    assert.equal(plan.receive.amount, D + want);
+    const sold = want * 10_000_000n / 101n;           // at the better rate the user sells fewer tokens ...
+    assert.equal(plan.receive.amount, D + want);       // ... keeps the carrier on the receive output ...
+    assert.deepEqual(plan.refund?.assets, { [usd]: U - sold }); // ... and gets the rest back (maker-funded dust)
     const { txid } = await fill(chain, swap, coin, maker, plan);
     assert.equal(BigInt((await outputAt(chain, txid, 0)).value), D + want);
+    assert.equal(usdOf(await outputAt(chain, txid, 2), usd), U - sold);
   });
 
-  await t.test('offchain only: the fill and refund leaves refuse batch intents', async () => {
+  await t.test('offchain only: the fill and refund leaves refuse batch intents and the on-chain endpoint', async () => {
     // Without the gate a fill co-signed before the deadline could be held and settled after it,
     // and a registered intent would block both refund paths (DESIGN.md §2, §5).
     const swap = swapCovenant(chain, terms({ deadline: now() + 10n }));
     const coin = await deposit(chain, user, swap, 50_000);
     const cosigner = '02' + hex(publicKey(64));
-    const gate = /opcode=OP_VERIFY position=7: /;   // the gate's VERIFY (byte 7), before any other check
+    const gate = /opcode=OP_VERIFY position=9: /;   // the gate's intent VERIFY (byte 9), before any other check
     const outs = [{ script: user.pkScript, amount: 50_000n }];
     // Before the deadline: a fill intent (fee index witness as an offchain fill would carry).
     const fillGate = await refused(() => emulatorSignedIntent(chain, coin, swap.tree, swap.fill, outs, registerMessage(cosigner),
       { leaf: LEAF.fill, witness: [num(0)] }), gate);
     note('swap fill via intent', fillGate.message);
+    // ... and through the emulator's on-chain endpoint, which runs scripts without an intent message.
+    const onchain = await rejectedWith(/opcode=OP_PUSHEXPIRY .*expiry not set/, () =>
+      onchainSignedIntent(chain, coin, swap.tree, swap.fill, outs, registerMessage(cosigner)));
+    note('swap fill via the on-chain endpoint', onchain.message);
     while (now() <= swap.terms.deadline + 1n) await new Promise(r => setTimeout(r, 1000));
     // After the deadline: refund-anyone, as a plain register intent and with an on-chain output
     // (which arkd moves into the commitment tx, shifting the VTXO outputs' indexes).

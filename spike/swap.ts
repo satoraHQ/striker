@@ -62,16 +62,23 @@ const pays = (idx: Ops, script: Uint8Array): Ops => [...idx, 'INSPECTOUTPUTSCRIP
 /** arkd only accepts outputs below dust as `OP_RETURN <taproot key>` ("subdust" VTXOs,
  * recoverable by the key holder in a batch). Fees can be tiny, so accept both forms. */
 export const subdustScript = (p2tr: Uint8Array) => Uint8Array.from([0x6a, 0x20, ...program(p2tr)]);
+/** Output at the index on the stack pays `script`'s key, as P2TR or (below dust) its sub-dust form; keeps the index. */
+const paysEither = (script: Uint8Array): Ops => [
+  'DUP', 'INSPECTOUTPUTSCRIPTPUBKEY', 'DUP', 1, 'EQUAL',
+  'IF', 'DROP', program(script), 'EQUALVERIFY',
+  'ELSE', -1, 'EQUALVERIFY', sha256(subdustScript(script)), 'EQUALVERIFY', 'ENDIF',
+];
 const paysFee = (script: Uint8Array): Ops => [
   'DUP', 'INSPECTOUTPUTSCRIPTPUBKEY', 'DUP', 1, 'EQUAL',
   'IF', 'DROP', program(script), 'EQUALVERIFY',
   'ELSE', -1, 'EQUALVERIFY', sha256(subdustScript(script)), 'EQUALVERIFY', 'ENDIF',
 ];
 
-/** Fails when the emulator evaluates the leaf for a batch intent. Without it a fill co-signed
- * before the deadline could be held and settled in a batch after it (arkd never re-runs the
- * script), and a registered intent would block both refund paths. See DESIGN.md §2. */
-const offchainOnly: Ops = [new TextEncoder().encode('type'), 'INSPECTINTENTMESSAGE', 'NOT', 'VERIFY', 'DROP'];
+/** Leaves only the one-shot offchain SubmitTx path. OP_PUSHEXPIRY fails on the emulator's on-chain
+ * endpoint (no VTXO expiry there), the intent check fails for batch intents; both of those return a
+ * signature the caller can register in a batch after the deadline (arkd never re-runs the script),
+ * and a registered intent blocks both refund paths. See DESIGN.md §2. */
+const offchainOnly: Ops = ['PUSHEXPIRY', 'DROP', new TextEncoder().encode('type'), 'INSPECTINTENTMESSAGE', 'NOT', 'VERIFY', 'DROP'];
 
 /**
  * Constants the fill leaf bakes in, mirrored off-chain by planFill().
@@ -101,7 +108,8 @@ export function constants(t: SwapTerms) {
 
 /**
  * Fill leaf. Failure classes (the emulator log shows the opcode):
- *   batch intent              OP_VERIFY failed (first opcodes: the offchain-only gate)
+ *   on-chain endpoint         OP_PUSHEXPIRY expiry not set (the offchain-only gate)
+ *   batch intent              OP_VERIFY failed (the offchain-only gate)
  *   deadline passed           OP_NUMEQUALVERIFY failed
  *   wrong destination script  OP_EQUALVERIFY failed
  *   rate / receive amount     OP_VERIFY failed
@@ -142,11 +150,11 @@ export function fillScript(t: SwapTerms): Uint8Array {
       ...common,
       CUR, ...buy, 'INSPECTOUTASSETLOOKUP', 'DROP', t.exactOut, 'GREATERTHANOREQUAL', 'VERIFY',
       CUR, 'INSPECTINPUTVALUE', D + c.maxSpend!, 'SUB',                // R = unused sats
-      'DUP', D, 'GREATERTHANOREQUAL',
-      'IF',
-        ...refundIdx, 'DUP', 'INSPECTOUTPUTSCRIPTPUBKEY', 1, 'EQUALVERIFY', program(t.refund), 'EQUALVERIFY',
+      'DUP', 0, 'GREATERTHAN',
+      'IF',                                                            // any R goes back; below dust as OP_RETURN <key>
+        ...refundIdx, ...paysEither(t.refund),
         'INSPECTOUTPUTVALUE', 'LESSTHANOREQUAL', 'NOTIF', 'RETURN', 'ENDIF',
-      'ELSE', 'DROP', 'ENDIF',                                         // sub-dust R is slippage
+      'ELSE', 'DROP', 'ENDIF',
       c.fee!, ...tail,
     ]);
   }
@@ -282,6 +290,7 @@ export interface FillPlan { receive: Out; fee?: Out; refund?: Out; feeIndexOverr
  */
 export function planFill(swap: Swap, coin: CoinLike, rate = swap.terms.rate): FillPlan {
   const t = swap.terms, D = t.dust, c = constants(t);
+  if (rate.num <= 0n || rate.den <= 0n) throw new Error('Invalid rate');
   if (rate.num * t.rate.den < t.rate.num * rate.den) throw new Error('Rate below min_rate');
   const fee = (sats: bigint): Out | undefined => t.feeBps > 0n
     ? { script: sats < D ? subdustScript(t.feeScript) : t.feeScript, amount: sats } : undefined;
@@ -298,19 +307,22 @@ export function planFill(swap: Swap, coin: CoinLike, rate = swap.terms.rate): Fi
     }
     const spend = t.exactOut * rate.den / rate.num, R = S - D - spend;   // spend ≤ maxSpend, fee included
     if (R < 0n) throw new Error('Deposit too small for the exact-out amount');
+    // Every unspent sat goes back: below dust as the refund key's sub-dust (OP_RETURN) output.
     return { receive: { script: t.receive, amount: D, assets: { [t.buy]: t.exactOut } }, fee: fee(c.fee!),
-      ...(R >= D ? { refund: { script: t.refund, amount: R } } : {}) };   // a sub-dust remainder stays with the maker
+      ...(R > 0n ? { refund: { script: R < D ? subdustScript(t.refund) : t.refund, amount: R } } : {}) };
   }
   const U = assetsOf(coin)[t.sell] ?? 0n;
   if (t.exactOut === undefined)
     return { receive: { script: t.receive, amount: S + atLeast(U) }, fee: fee(feeOf(U * t.rate.num / t.rate.den, t.feeBps)) };
-  // The covenant takes the token-change branch iff U > maxSpend; the plan must match it.
-  if (U > c.maxSpend!) {
-    const sold = ceilDiv(t.exactOut * rate.den, rate.num), keep = U - (sold < c.maxSpend! ? sold : c.maxSpend!);
+  // The user sells at most floor(want / rate) tokens (≤ maxSpend), the rest comes back.
+  const sold = t.exactOut * rate.den / rate.num, keep = U - sold;
+  // The covenant takes the token-change branch iff U > maxSpend, moving the carrier to the change;
+  // otherwise the carrier stays on the receive output and any change's dust is funded by the maker.
+  if (U > c.maxSpend!)
     return { receive: { script: t.receive, amount: S - D + t.exactOut }, fee: fee(c.fee!),
       refund: { script: t.refund, amount: D, assets: { [t.sell]: keep } } };
-  }
-  return { receive: { script: t.receive, amount: S + t.exactOut }, fee: fee(c.fee!) };   // the user sells all U ≤ maxSpend
+  return { receive: { script: t.receive, amount: S + t.exactOut }, fee: fee(c.fee!),
+    ...(keep > 0n ? { refund: { script: t.refund, amount: D, assets: { [t.sell]: keep } } } : {}) };
 }
 
 const add = (a: Record<string, bigint>, b: Record<string, bigint> = {}, sign = 1n) => {

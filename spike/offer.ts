@@ -89,9 +89,13 @@ function assetOps(id34: Uint8Array): Ops {
 /** Reads an 8-byte quote field as a number; expects the quote on top, keeps it. */
 const num = (off: number): Ops => ['DUP', off, 8, 'SUBSTR', 'BIN2NUM'];
 /** Range guard for a field just read: BIN2NUM reads a set top bit as a sign, so a signed field
- * ≥ 2^63 would be negative and void the floor, min_fill or rate check. `positive` also rejects 0. */
-const nonNegative: Ops = ['DUP', 0, 'GREATERTHANOREQUAL', 'VERIFY'];
+ * ≥ 2^63 would be negative and void the min_fill or rate check; `positive` also rejects 0 (and so
+ * negative zero). */
 const positive: Ops = ['DUP', 0, 'GREATERTHAN', 'VERIFY'];
+/** The floor may be 0, so `positive` can't guard it, and a ≥ 0 check after BIN2NUM misses the
+ * negative-zero encoding (00…00 80 → 0). Check the field's top byte instead: byte ‖ 0x01 read as
+ * a number is 256 + byte, which must be < 384 (top bit clear). Expects the quote on top, keeps it. */
+const topBitClear = (off: number): Ops => ['DUP', off + 7, 1, 'SUBSTR', 1, 'CAT', 'BIN2NUM', 384, 'LESSTHAN', 'VERIFY'];
 const sats = (op: 'INSPECTINPUTVALUE' | 'INSPECTOUTPUTVALUE'): Ops => ['PUSHCURRENTINPUTINDEX', op];
 /** USD balance of this input/output. The asset id lives on the altstack as [gidx txid] (txid on
  * top); it is pulled, copied back, and consumed by the lookup. 0 when the asset is absent. */
@@ -109,9 +113,10 @@ export function fillScript(ctx: QuoteContext, side: Side): Uint8Array {
     ? [sats('INSPECTINPUTVALUE'), sats('INSPECTOUTPUTVALUE'), usd('INSPECTINASSETLOOKUP'), usd('INSPECTOUTASSETLOOKUP')]
     : [usd('INSPECTINASSETLOOKUP'), usd('INSPECTOUTASSETLOOKUP'), sats('INSPECTINPUTVALUE'), sats('INSPECTOUTPUTVALUE')];
   return arkade.ArkadeScript.encode([
-    // --- offchain only: an intent proof must never satisfy this leaf (see the emulator findings in
-    //     README.md: a proof co-signed before expiry can be registered in a batch after it).
-    new TextEncoder().encode('type'), 'INSPECTINTENTMESSAGE', 'NOT', 'VERIFY', 'DROP',
+    // --- offchain only (DESIGN.md §2): OP_PUSHEXPIRY fails on the emulator's on-chain endpoint (no
+    //     VTXO expiry there), the intent check fails for batch intents. Either path would hand back a
+    //     signature that can be registered in a batch after expiry; only the one-shot SubmitTx remains.
+    'PUSHEXPIRY', 'DROP', new TextEncoder().encode('type'), 'INSPECTINTENTMESSAGE', 'NOT', 'VERIFY', 'DROP',
     // --- quote authenticity: BIP340 over tagged_hash(tag, quote); SHA256(tag) pushed once, doubled with CAT
     'DUP', 'TOALTSTACK', quoteTagHash(ctx, side), 'DUP', 'CAT', 'SWAP', 'CAT', 'SHA256', ctx.maker, 'CHECKSIGFROMSTACK', 'VERIFY',
     'FROMALTSTACK', 'SIZE', QUOTE_LENGTH, 'EQUALVERIFY',                                   // [q]
@@ -119,7 +124,7 @@ export function fillScript(ctx: QuoteContext, side: Side): Uint8Array {
     ...assetOps(assetBytes(ctx.usd)), 'TOALTSTACK', 'TOALTSTACK',                           // USD id parked on the altstack
     // --- sold = sell_in − sell_out, with the floor on the sell-side change balance
     ...sellIn, ...sellOut, 'TUCK', 'SUB',                                                   // [q sell_out sold]
-    'SWAP', 2, 'PICK', OFF.floor, 8, 'SUBSTR', 'BIN2NUM', ...nonNegative, 'GREATERTHANOREQUAL', 'VERIFY', // sell_out ≥ floor → [q sold]
+    'SWAP', 2, 'PICK', ...topBitClear(OFF.floor), OFF.floor, 8, 'SUBSTR', 'BIN2NUM', 'GREATERTHANOREQUAL', 'VERIFY', // sell_out ≥ floor → [q sold]
     'DUP', 2, 'PICK', OFF.minFill, 8, 'SUBSTR', 'BIN2NUM', ...positive, 'GREATERTHANOREQUAL', 'VERIFY', // sold ≥ min_fill > 0
     // --- received = buy_out − buy_in, then received × rate_den ≥ sold × rate_num (maker's favour)
     ...buyOut, ...buyIn, 'SUB',                                                             // [q sold received]

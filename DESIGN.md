@@ -64,12 +64,18 @@ Every covenant VTXO follows the emulator's dual-VM model:
   front, §8). If any other key comes after the emulator key, the emulator is not the finalizer and hands its signatures back to the caller,
   who can then submit them to arkd after a quote has expired.
 - **Every covenant leaf except Renew is offchain-only:** the offer Fill leaves and the swap
-  Fill and Refund-anyone leaves. Each starts with `"type" OP_INSPECTINTENTMESSAGE OP_NOT
-  OP_VERIFY OP_DROP`. Without this gate, an intent proof signed before expiry (or a deadline)
-  can be held and settled in a batch at any later time, because the batch path never re-runs
-  the script; merely registering it also locks the VTXO against every other spend. Offchain
-  spends are validated, signed, submitted and finalized in a single emulator `SubmitTx` call.
-  The first review missed this on the swap covenant; `20-swap` now checks both leaves.
+  Fill and Refund-anyone leaves. Each starts with `OP_PUSHEXPIRY OP_DROP "type"
+  OP_INSPECTINTENTMESSAGE OP_NOT OP_VERIFY OP_DROP`. The emulator signs on three paths, and two
+  of them hand the signature back to the caller: `SubmitIntent` (batch intents) and
+  `SubmitOnchainTx` (on-chain txs, which checks prevouts only by hash, so a batch-intent proof
+  with its synthetic BIP322 prevout passes as one). A proof signed either way before expiry (or a
+  deadline) can be held and settled in a batch later, because the batch path never re-runs the
+  script; merely registering it also locks the VTXO against every other spend. The intent check
+  stops the first path; `OP_PUSHEXPIRY` stops the second, because only the offchain and intent
+  paths know the VTXO's expiry ("OP_PUSHEXPIRY expiry not set"). What remains is `SubmitTx`,
+  which validates, signs, submits and finalizes in one call. `30-emulator-late` settles a held
+  on-chain-signed proof after expiry against an intent-only gate, and shows the full gate
+  refusing it. The swap covenant missed the gate entirely at first (review, 2026-11-18).
 
 ## 3. Signed quote
 
@@ -97,8 +103,9 @@ tag = "striker/quote/v2" ‖ maker_pubkey(32) ‖ epoch(u64 LE) ‖ asset_id(34)
 - Fields are u63 in practice: BIN2NUM reads a set top bit as a sign, and a negative floor,
   `min_fill` or rate would void its check (a negative `rate_num` sells for nothing). The
   signer refuses such values and the Fill leaf range-checks each field (`rate_num`, `rate_den`,
-  `min_fill` > 0, `floor` ≥ 0; a negative expiry already fails), so a third-party signer that
-  skips the rule can't be filled on such a quote.
+  `min_fill` > 0; `floor` by its top byte, since `00…00 80` is negative zero and reads as 0; a
+  negative expiry already fails), so a third-party signer that skips the rule can't be filled
+  on such a quote.
 - **Floor instead of maximum.** "Up to X" could be reused on every chained change VTXO. A
   balance floor bounds what a chain of partial fills can take from *one* VTXO, with no extra
   state. It is not a cumulative cap: two VTXOs at the same offer address can each be filled
@@ -138,7 +145,7 @@ sold     = input.sell_bal − change.sell_bal
 received = change.buy_bal − input.buy_bal
 sold     ≥ quote.min_fill
 received × rate_den ≥ sold × rate_num            // rounded in the maker's favour
-rate_num, rate_den, min_fill > 0; floor ≥ 0      // range checks (fields are u63)
+rate_num, rate_den, min_fill > 0; floor < 2^63  // range checks (fields are u63)
 change.sell_bal ≥ quote.floor
 all other assets preserved exactly            // OP_TUNNEL flags 5, traded token excepted
 ```
@@ -178,7 +185,8 @@ Parameters: `receive_address`, `refund_address`, `fee_address`, `sell_asset`, `b
 - A fee below 330 sats must go to the fee key's `OP_RETURN <key>` sub-dust form; arkd
   rejects other outputs below dust.
 - Exact-out fixes `max_spend = floor(want / min_rate)` (rounded in the user's favour, fee
-  included on the BTC side) and the fee in the script. A BTC remainder below dust is forfeited.
+  included on the BTC side) and the fee in the script. Every unspent sat goes back; a
+  remainder below dust as the refund key's `OP_RETURN <key>` sub-dust output.
   A deposit below `max_spend` only fills if a maker accepts the better rate; otherwise it refunds
   after the deadline.
 
@@ -267,8 +275,10 @@ based on the emulator's non-interactive delegate pattern (`test/delegate_test.go
 - The Renew leaf is `[striker, arkd, emulator ⊕ renewScript]`: only Striker can produce a
   registrable renewal proof (arkd refuses one without Striker's signature, `missing signature`),
   so nobody else can register a renewal and lock the VTXO against fills. Striker also signs the
-  forfeit in the batch. The emulator key stays last, so the emulator is still the finalizer.
-  This is a trusted role: Striker could refuse to renew, but can't move funds.
+  forfeit in the batch. The leaf is batch-only, so key order doesn't matter for `SubmitTx`
+  finalization; in the batch the emulator signs the proof and forfeit and returns them, and
+  Striker's batch handler submits them. This is a trusted role: Striker could refuse to renew,
+  but can't move funds.
 - Striker acts as delegate and renews offer covenants before expiry, and also after N fills,
   since renewal resets chain depth to 1 and keeps L1 exits cheap. Swap covenants are short-lived and normally settle or
   refund before needing renewal.
@@ -379,7 +389,7 @@ upstream emulator v0.0.10-rc.0, `@arkade-os/sdk` 0.5.6); see `spike/`.
 | §13 item | Result |
 |---|---|
 | 1 Quote validity | ✔ bad signature, wrong epoch, expired and underpaying fills refused |
-| 2 Late submission | ⚠ possible via batch intents and via leaves with a key after the emulator; closed by the offchain-only gate and `[server, emulator]` leaves (§2) |
+| 2 Late submission | ⚠ possible via batch intents, via the emulator's on-chain endpoint and via leaves with a key after the emulator; closed by the `OP_PUSHEXPIRY` + intent gate and `[server, emulator]` leaves (§2) |
 | 3 Floor | ✔ holds across 3 chained partial fills; `min_fill` enforced |
 | 4 Epoch bump | ✔ owner-leaf self-spend cancels all old quotes |
 | 5 Two-asset offer VTXO | ✔ fills in both directions, payments land in the change |
