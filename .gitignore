@@ -9,3 +9,5 @@ dist/
 
 .emulator/
 *.moved-to-prod/
+playwright-report/
+test-results/

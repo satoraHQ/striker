@@ -4,9 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "tsc --noEmit",
+    "check": "tsc --noEmit -p tsconfig.json",
     "regtest": "node scripts/regtest.mjs",
-    "spike": "node --import tsx --test --test-concurrency=1 spike/*.test.ts"
+    "spike": "node --import tsx --test --test-concurrency=1 spike/*.test.ts",
+    "test": "node --import tsx --test packages/core/test/unit.test.ts apps/web/test/unit.test.ts",
+    "e2e": "node --import tsx --test --test-concurrency=1 packages/core/test/*.regtest.test.ts apps/striker/test/*.test.ts && npm run e2e -w apps/web",
+    "dev": "node --import tsx scripts/dev.ts"
   },
   "dependencies": {
     "@arkade-os/sdk": "0.5.6",
@@ -21,5 +24,9 @@
   },
   "engines": {
     "node": ">=22"
-  }
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ]
 }
