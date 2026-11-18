@@ -8,7 +8,8 @@
     "regtest": "node scripts/regtest.mjs",
     "spike": "node --import tsx --test --test-concurrency=1 spike/*.test.ts",
     "test": "npm test --workspaces --if-present",
-    "e2e": "node --import tsx --test --test-concurrency=1 packages/core/test/*.regtest.test.ts apps/striker/test/*.regtest.test.ts"
+    "e2e": "node --import tsx --test --test-concurrency=1 packages/core/test/*.regtest.test.ts apps/striker/test/*.regtest.test.ts",
+    "dev": "node --import tsx scripts/dev.ts"
   },
   "dependencies": {
     "@arkade-os/sdk": "0.5.6",
