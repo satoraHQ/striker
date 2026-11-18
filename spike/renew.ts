@@ -2,7 +2,7 @@
 //
 // Covenant tree (dual-VM model, §2):
 //   leaf 0  covenant placeholder   [server, emulator ⊕ fillScript]
-//   leaf 1  Renew (delegate)       [server, emulator ⊕ renewScript]   batch registration only
+//   leaf 1  Renew (delegate)       [delegate, server, emulator ⊕ renewScript]   batch registration only
 //   leaf 2  Owner                  [owner, server]
 //   leaf 3  Exit (L1)              owner + CSV(seconds)
 //
@@ -13,11 +13,11 @@
 // intent proof, because input 0 is the BIP322 message input) to the input's
 // script, value and assets. The time gate uses OP_PUSHEXPIRY so renewal opens
 // only `window` seconds before the VTXO expires.
-import { EsploraProvider, EmulatorPacket, Estimator, Extension, OnchainWallet, Proof, Transaction, TreeSignerSession,
+import { EsploraProvider, EmulatorPacket, Estimator, Extension, MultisigTapscript, OnchainWallet, Proof, SingleKey, Transaction, TreeSignerSession,
   Unroll, VtxoScript, arkade, asset, resolvePrevTxs, timelockToSequence, Batch,
   type Network, type SignerSession, type VirtualCoin, type IndexerProvider } from '@arkade-os/sdk';
 import { RawTx, RawWitness, SigHash } from '@scure/btc-signer';
-import { b64, covenantLeaf, covenantTree, exitLeaf, hex, ownerLeaf, regtest, unhex, waitFor, type Chain } from './harness.js';
+import { b64, covenantTree, exitLeaf, hex, ownerLeaf, regtest, unhex, waitFor, type Chain } from './harness.js';
 
 export const utf8 = (s: string) => new TextEncoder().encode(s);
 
@@ -28,6 +28,9 @@ const TUNNEL_SCRIPT = 1, TUNNEL_VALUE = 2, TUNNEL_ASSETS = 4;
 export interface RenewLeafOptions {
   /** Hex (33-byte compressed) tree-signer key of the delegate: `hex(await session.getPublicKey())`. */
   cosigner: string;
+  /** X-only signing key of the delegate. It is a key in the Renew leaf, so only the delegate can
+   * produce a registrable renewal proof (no one else can register one to lock the VTXO). */
+  delegateKey: Uint8Array;
   /** Seconds before VTXO expiry from which renewal is allowed (OP_PUSHEXPIRY - window ≤ now). */
   window: bigint;
   /**
@@ -64,7 +67,10 @@ export interface RenewableCovenant { tree: VtxoScript; fill: Uint8Array; renew: 
 /** Builds the four-leaf covenant tree described at the top of this file. */
 export function renewableCovenant(chain: Chain, owner: Uint8Array, fill: Uint8Array, renew: RenewLeafOptions, exitDelay = 1536n): RenewableCovenant {
   const renewBytes = renewScript(renew);
-  const tree = covenantTree(chain, fill, [covenantLeaf(chain, renewBytes), ownerLeaf(chain, owner), exitLeaf(owner, exitDelay)]);
+  // The emulator key stays last, so the emulator remains the finalizer (DESIGN.md §2).
+  const renewLeaf = MultisigTapscript.encode({ pubkeys: [renew.delegateKey, chain.server,
+    arkade.computeArkadeScriptPublicKey(chain.emulatorKey, renewBytes)] }).script;
+  const tree = covenantTree(chain, fill, [renewLeaf, ownerLeaf(chain, owner), exitLeaf(owner, exitDelay)]);
   return { tree, fill, renew: renewBytes, owner, exitDelay };
 }
 
@@ -120,10 +126,15 @@ export function expectedIntentFee(chain: Chain, coin: VirtualCoin, output: Renew
  * needs a *fresh* session: a session's musig2 nonces must never be reused. `session()` makes one
  * per round from the same secret, so the cosigner stays the pinned key. The delegate holds no key
  * in the covenant; forfeits are signed by arkd and the emulator. */
-export interface Delegate { secret: Uint8Array; session: () => SignerSession; cosigner: string }
+export interface Delegate { secret: Uint8Array; session: () => SignerSession; cosigner: string; identity: SingleKey; key: Uint8Array }
 export async function delegate(treeSignerSecret: Uint8Array): Promise<Delegate> {
   const session = () => new TreeSignerSession(treeSignerSecret);
-  return { secret: treeSignerSecret, session, cosigner: hex(await session().getPublicKey()) };
+  const identity = SingleKey.fromPrivateKey(treeSignerSecret);
+  return { secret: treeSignerSecret, session, cosigner: hex(await session().getPublicKey()), identity, key: await identity.xOnlyPublicKey() };
+}
+/** The delegate adds its Renew-leaf signature to an emulator-approved proof. */
+export async function delegateSign(striker: Delegate, approvedProof: string) {
+  return b64((await striker.identity.sign(Transaction.fromPSBT(Uint8Array.from(Buffer.from(approvedProof, 'base64'))))).toPSBT());
 }
 
 /**
@@ -140,8 +151,10 @@ export async function renewThroughBatch(chain: Chain, striker: Delegate, intent:
   void first.catch(() => {});
   const primed = (async function* () { const f = await first; if (!f.done) yield f.value; yield* stream; })();
   try {
-    const intentId = await chain.ark.registerIntent({ proof: approvedProof, message: intent.message });
-    const handler = arkade.createArkadeBatchHandler(intentId, [intent.input], undefined, approvedProof, intent.message,
+    const proof = await delegateSign(striker, approvedProof);
+    const intentId = await chain.ark.registerIntent({ proof, message: intent.message });
+    // The Renew leaf names the delegate's key, so the delegate also signs the forfeit.
+    const handler = arkade.createArkadeBatchHandler(intentId, [intent.input], striker.identity, proof, intent.message,
       striker.session(), chain.ark, chain.emulator, network);
     return await Batch.join(primed, handler, { abortController: abort });
   } finally { abort.abort(); }

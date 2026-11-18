@@ -60,8 +60,8 @@ Every covenant VTXO follows the emulator's dual-VM model:
   Arkade script hash. The emulator signs only if the Arkade Script passes. They are valid off-chain only.
 - **An exit leaf** is plain tapscript, owner key + CSV, executable on L1 without the emulator.
   arkd only accepts seconds-based CSV (a multiple of 512, ≥ `unilateralExitDelay`).
-- **Covenant leaves are exactly `[server, emulator]`.** If any other key comes after the
-  emulator key, the emulator is not the finalizer and hands its signatures back to the caller,
+- **Covenant leaves are exactly `[server, emulator]`** (the Renew leaf adds Striker's key in
+  front, §8). If any other key comes after the emulator key, the emulator is not the finalizer and hands its signatures back to the caller,
   who can then submit them to arkd after a quote has expired.
 - **Every covenant leaf except Renew is offchain-only:** the offer Fill leaves and the swap
   Fill and Refund-anyone leaves. Each starts with `"type" OP_INSPECTINTENTMESSAGE OP_NOT
@@ -126,7 +126,7 @@ funds new dust, and proceeds can immediately back offers on the other side.
 | Fill sell-BTC | Valid quote for this side (signature over the side's tag, expiry) + the fill rules below |
 | Fill sell-asset | Same, the other direction |
 | Owner | Maker key: withdraw, re-price, epoch bump |
-| Renew | Anyone (Striker as delegate): batch registration only, script and value preserved. Proven on a separate test covenant; the prototype adds it to the offer tree. |
+| Renew | Striker only (`[striker, arkd, emulator]`): batch registration only, script and value preserved. Proven on a separate test covenant; the prototype adds it to the offer tree. |
 | Exit (L1) | Maker key + CSV |
 
 **Fill rules** for maker input `i`, change at its paired output (fixed index pairing, so two
@@ -264,11 +264,11 @@ based on the emulator's non-interactive delegate pattern (`test/delegate_test.go
   That key must be stable: rotating it means every owner re-deposits. SDK ≥ 0.5.4 exports a
   deterministic `TreeSignerSession` (constructed from a secret), so the pinned key is stable;
   a fresh session is still built per batch, since musig2 nonces must never be reused.
-- The Renew leaf is anyone-callable: the intent message only has to name Striker's cosigner
-  key, which is public. Anyone can therefore register a faithful renewal they can't complete
-  and so lock a covenant VTXO against fills until the round fails. Funds can't move (OP_TUNNEL
-  pins everything); Striker watches for registrations naming its key and completes them, which
-  caps the lock at one round.
+- The Renew leaf is `[striker, arkd, emulator ⊕ renewScript]`: only Striker can produce a
+  registrable renewal proof (arkd refuses one without Striker's signature, `missing signature`),
+  so nobody else can register a renewal and lock the VTXO against fills. Striker also signs the
+  forfeit in the batch. The emulator key stays last, so the emulator is still the finalizer.
+  This is a trusted role: Striker could refuse to renew, but can't move funds.
 - Striker acts as delegate and renews offer covenants before expiry, and also after N fills,
   since renewal resets chain depth to 1 and keeps L1 exits cheap. Swap covenants are short-lived and normally settle or
   refund before needing renewal.
@@ -281,7 +281,7 @@ based on the emulator's non-interactive delegate pattern (`test/delegate_test.go
   runtime and skips renewal if it would cost anything.
 - **Fallback: a fee-capped Renew leaf** (`OP_TUNNEL` flags 5 plus `out.value ≥ in.value − maxFee`,
   and exactly two proof outputs so the slack can only go to arkd as fee, never to an extra
-  output of whoever renews; anyone can still make a renewal overpay arkd by up to `maxFee`).
+  output; with the leaf pinned to Striker's key, only Striker could make it overpay).
   arkd's fee is `Σin − Σout`, so an exact-value renewal fails as soon as a server charges
   anything (spike: `INTENT_INSUFFICIENT_FEE … got 0 min expected 200`). A change to the fee
   program would otherwise strand covenant VTXOs. The spike renewed a sats + USD covenant through

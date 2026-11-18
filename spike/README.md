@@ -439,12 +439,14 @@ each asking whether anyone can make a maker or taker lose money. Fixed in this b
   fills, no underpayment. Fixed, with uneven-amount and improved-rate exact-out tests.
 - **Fee-capped Renew leaf slack** (all three): exactly two proof outputs, so the slack can only
   go to arkd as fee; `40-renew` shows an extra output being refused.
+- **Anyone could register a Renew intent** (Fable, Kimi) and lock the VTXO against fills. The
+  Renew leaf is now `[striker, arkd, emulator]`: arkd refuses a proof without Striker's
+  signature, and Striker signs the forfeit in the batch.
 - **The L1 exit did not show the asset** (Terra): the exit spend now carries the asset packet.
   How those units are used afterwards is open (DESIGN.md §14).
 
 Documented rather than changed: the floor bounds one VTXO, not the offer (DESIGN.md §3); the
-real offer tree has no Renew leaf yet (prototype); Renew registrations can be griefed; the
-emulator operator's clock decides expiry; offline exit needs saved exit data (DESIGN.md §10).
+real offer tree has no Renew leaf yet (prototype); the emulator operator's clock decides expiry; offline exit needs saved exit data (DESIGN.md §10).
 
 ## Regtest housekeeping
 
