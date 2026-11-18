@@ -23,6 +23,9 @@ export interface Config {
   offerExitSeconds: bigint;
   swapExitSeconds: bigint;
   batchWindowMs: number;
+  /** Renew an offer VTXO once it has less than this many seconds left (clamped to the window). */
+  renewBefore: number;
+  renewCheckMs: number;
 }
 
 /** Striker's key: tree signer, Renew-leaf key and fee wallet. Kept in `<dataDir>/secret`. */
@@ -50,5 +53,7 @@ export function loadConfig(): Config {
     offerExitSeconds: BigInt(env('OFFER_EXIT_SECONDS', '1536')),
     swapExitSeconds: BigInt(env('SWAP_EXIT_SECONDS', '1536')),
     batchWindowMs: Number(env('BATCH_WINDOW_MS', '200')),
+    renewBefore: Number(env('RENEW_BEFORE', String(6 * 3600))),
+    renewCheckMs: Number(env('RENEW_CHECK_MS', '30000')),
   };
 }

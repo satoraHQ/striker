@@ -15,6 +15,7 @@ import {
   type PublishQuotesRequest, type RenewParams, type Side, type SignedQuote, type Swap, type SwapStatus, type SwapTerms, type SwapView,
 } from '@striker/core';
 import type { Config } from './config.js';
+import { renewalFee, renewOffer, type RenewDeps } from './renew.js';
 
 const now = () => Math.floor(Date.now() / 1000);
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
@@ -31,6 +32,9 @@ interface OfferState {
   coin?: Coin & { expiresAt?: Date };
   /** Refresh the coin from the indexer before the next fill (after a failure or a new deposit). */
   stale: boolean;
+  /** Registered for renewal: the VTXO is locked until the batch ends, so no fills. */
+  renewing?: boolean;
+  renewedAt?: number;
 }
 interface SwapRecord {
   id: string; swap: Swap; status: SwapStatus; createdAt: number;
@@ -43,6 +47,8 @@ export class Striker extends EventEmitter {
   private swaps = new Map<string, SwapRecord>();
   private ticking = false;
   private timer?: NodeJS.Timeout;
+  private renewTimer?: NodeJS.Timeout;
+  private renewDeps?: RenewDeps;
   readonly identity: SingleKey;
 
   private constructor(
@@ -83,8 +89,38 @@ export class Striker extends EventEmitter {
     };
   }
 
-  start() { this.timer = setInterval(() => void this.tick(), this.config.batchWindowMs); }
-  stop() { clearInterval(this.timer); }
+  start() {
+    this.timer = setInterval(() => void this.tick(), this.config.batchWindowMs);
+    this.renewTimer = setInterval(() => void this.renewDue(), this.config.renewCheckMs);
+  }
+  stop() { clearInterval(this.timer); clearInterval(this.renewTimer); }
+
+  // ------------------------------------------------------------------ renewal (DESIGN.md §8)
+
+  private async renewDue() {
+    this.renewDeps ??= { ark: this.ark, indexer: this.indexer, emulator: this.emulator, network: this.chain.network, identity: this.identity,
+      secret: this.config.secret, cosigner: this.renew.cosigner, fees: (await this.ark.getInfo()).fees?.intentFee ?? {} };
+    const before = Math.min(this.config.renewBefore, Number(this.renew.window));
+    for (const st of this.offers.values()) {
+      // A just-renewed VTXO has a full lifetime; don't renew the same offer again right away.
+      if (st.renewing || (st.renewedAt && Date.now() - st.renewedAt < 10 * 60_000)) continue;
+      const { vtxos } = await this.indexer.getVtxos({ scripts: [hex(st.offer.tree.pkScript)], spendableOnly: true });
+      for (const coin of vtxos) {
+        const left = coin.expiresAt ? (coin.expiresAt.getTime() - Date.now()) / 1000 : Infinity;
+        if (left > before || left <= 0) continue;
+        const fee = renewalFee(this.renewDeps, coin);
+        if (fee > 0n) { log(`offer ${st.offer.address.slice(0, 16)}… renewal would cost ${fee} sats; skipped`); continue; }
+        st.renewing = true;
+        log(`renewing ${coin.txid}:${coin.vout} of offer ${st.offer.address.slice(0, 16)}… (${Math.round(left)} s left)`);
+        try {
+          const commitment = await renewOffer(this.renewDeps, st.offer, coin);
+          log(`renewed in batch ${commitment}`);
+          st.renewedAt = Date.now();
+        } catch (e) { log(`renewal failed: ${(e as Error).message.slice(0, 300)}`); }
+        finally { st.renewing = false; st.stale = true; this.bookChanged(); }
+      }
+    }
+  }
 
   // ------------------------------------------------------------------ book
 
@@ -307,6 +343,7 @@ export class Striker extends EventEmitter {
       let pending = ready.filter(r => (r.swap.terms.sell === BTC ? SELL_ASSET : SELL_BTC) === side);
       for (const { st, q } of this.candidates(side)) {
         if (!pending.length) break;
+        if (st.renewing) continue;
         if (st.stale) await this.refreshOffer(st);
         if (!st.coin) continue;
         const { settlement, skipped } = planSettlement(pending.map(r => ({ swap: r.swap, coin: r.coin! })), { offer: st.offer, coin: st.coin, quote: q },
