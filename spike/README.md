@@ -1,7 +1,7 @@
 # v2 covenant spike
 
 Proves the covenants in `DESIGN.md` §13 against arkd + the upstream emulator on regtest.
-57/57 green on a fresh arkd **v0.9.25** (standalone signer, postgres + redis), upstream emulator
+59/59 green on a fresh arkd **v0.9.25** (standalone signer, postgres + redis), upstream emulator
 **ghcr.io/arkade-os/emulator:v0.0.10-rc.0**, `@arkade-os/sdk` **0.5.6**, arkade-regtest `7c91a6b`.
 
 ```sh
@@ -70,7 +70,7 @@ Quote: 40 bytes, `rate_num(8) ‖ rate_den(8) ‖ floor(8) ‖ min_fill(8) ‖ e
 `tag = "striker/quote/v2" ‖ maker(32) ‖ epoch(u64 LE) ‖ usd_asset(34, as the SDK serializes it: txid ‖
 u16 LE gidx) ‖ side(1)`: version, maker, epoch, asset and side are bound by the tag, so the message
 carries only the five numbers and each leaf's `SHA256(tag)` constant is what a wrong-epoch, wrong-asset or
-wrong-side quote fails against. Witness: `[signature, quote]`. Fill script (219 B per side):
+wrong-side quote fails against. Witness: `[signature, quote]`. Fill script (230 B per side):
 offchain-only gate (`"type" INSPECTINTENTMESSAGE NOT VERIFY DROP`, see the emulator findings) → tagged
 hash rebuilt in-script (`<SHA256(tag)> DUP CAT SWAP CAT SHA256 <maker> CHECKSIGFROMSTACK VERIFY`) →
 `SIZE 40 EQUALVERIFY` → `expiry BIN2NUM CHECKTIME NOT VERIFY` → the USD id (`txid gidx`) pushed once
@@ -110,12 +110,12 @@ git history before this change.
   balances but the taker's script → `input 1: … does not preserve source script`,
   i.e. the TUNNEL script check is the last line of defence. Honest 2 makers + 2 takers (one
   selling BTC, one selling USD) in one tx: 5 510 WU (was ~9 900).
-- **Size (arkd `maxTxWeight` 40 000, `txFeeRate` 0):** 1 maker + 1 taker fill 2 966–3 018 WU
+- **Size (arkd `maxTxWeight` 40 000, `txFeeRate` 0):** 1 maker + 1 taker fill 3 010–3 062 WU
   (was 5 106–5 158); each extra plain-wallet taker **630 WU** (input + sig + output + packet
-  entries); each extra maker **1 950 WU** (was 4 090: 219 B script + 104 B witness in the
+  entries); each extra maker **1 994 WU** (was 4 090: 230 B script + 104 B witness in the
   OP_RETURN at 4 WU/B, plus input and change). Measured to arkd's refusal: **1 maker + 59 takers**
-  accepted (39 510 WU), 60 refused `TX_TOO_LARGE` (was 56/57); **19 makers + 1 taker** accepted
-  (38 078 WU), 20 refused (was 9/10; 20 before the quote-field range checks added 16 B per leaf). The emulator's CSFS budget (50/input, 200/request) and its
+  accepted (39 554 WU), 60 refused `TX_TOO_LARGE` (was 56/57); **19 makers + 1 taker** accepted
+  (38 914 WU), 20 refused (was 9/10; 20 before the range checks and the PUSHEXPIRY gate added 27 B per leaf). The emulator's CSFS budget (50/input, 200/request) and its
   64 intent-gated inputs per request are not binding. The shrink came from: one leaf per side (no
   `IF/ELSE`, no second direction's arithmetic; the emulator packet carries only the executed
   leaf's script, and the 4-leaf tree costs no extra control-block bytes over the 3-leaf one);
@@ -269,8 +269,8 @@ re-running the script).
   signed, `service.go:1101`):** 1 covenant input → **228** outputs (39 844 WU). Trivial
   covenant inputs → 1 output: **85** inputs (39 964 WU, ~470 WU/input, emulator 0.9 s).
   Arkade scripts and witnesses travel in the OP_RETURN emulator packet, so they cost 4 WU/byte.
-  The 219-byte offer Fill leaf plus its 104-byte witness costs ≈ 1 290 WU on top, which comes to
-  1 950 WU per maker input and 19 maker inputs per tx (measured in `10-offer-batch.test.ts`).
+  The 230-byte offer Fill leaf plus its 104-byte witness costs ≈ 1 340 WU on top, which comes to
+  1 994 WU per maker input and 19 maker inputs per tx (measured in `10-offer-batch.test.ts`).
 - **Emulator compute limits are per input and per request** (`pkg/arkade/compute_limits.go`):
   per input `CHECKSIG*`/`CHECKSIGFROMSTACK` 50, `INSPECTINTENTMESSAGE` 16, `ECMUL` 50, etc.,
   and ×4 per request (`requestInputBudget`). Measured: a tx can have at most **64**

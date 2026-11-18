@@ -156,7 +156,7 @@ all other assets preserved exactly            // OP_TUNNEL flags 5, traded token
 - `OP_INSPECT*ASSET*` take the asset txid byte-reversed relative to the SDK's `AssetId.txid`.
 - One Fill leaf per side: the emulator packet carries only the executed leaf's script, so each
   leaf holds one direction's arithmetic and the asset id once (parked on the altstack for the
-  two lookups and the `OP_TUNNEL` exception). Each Fill leaf in the spike is 219 bytes with a
+  two lookups and the `OP_TUNNEL` exception). Each Fill leaf in the spike is 230 bytes with a
   104-byte witness (was one 644-byte two-direction leaf with a 212-byte witness). Owner leaf
   `[maker, arkd]` (epoch bump and withdrawal need no emulator). Exit leaf maker + CSV 1536 s.
 
@@ -237,14 +237,15 @@ it out (§4).
   rebuilt without them.
 - Batch size is bounded by arkd's `maxTxWeight` (40 000 WU), checked after the emulator
   signs. Measured with the spike scripts: **1 maker + 59 takers**, or **19 makers + 1 taker**,
-  per tx. Each maker input costs ≈ 1 950 WU (the 219-byte Fill leaf and 104-byte witness travel
+  per tx. Each maker input costs ≈ 1 994 WU (the 230-byte Fill leaf and 104-byte witness travel
   in the OP_RETURN emulator packet at 4 WU/byte, plus input and change), each plain-wallet taker
-  ≈ 630 WU; a 1 maker + 1 taker fill is ~3 000 WU. The emulator also caps a request at 64
+  ≈ 630 WU; a 1 maker + 1 taker fill is ~3 050 WU. The emulator also caps a request at 64
   intent-gated inputs and 200 `OP_CHECKSIGFROMSTACK` checks, neither of which binds.
 - One emulator `SubmitTx` (script, sign, arkd submit and finalize) takes p50 22–30 ms (p95 25–34 ms)
   for a single-input self-spend on a fresh arkd v0.9.25 stack, flat with chain depth. On a stack
   with many earlier runs it rose to p50 ~60–80 ms. A 1 maker + 1 taker fill with an asset packet
-  measured p50 ~80 ms on such a stack. The cause is arkd's postgres event store: it loads an
+  measured p50 ~80 ms on such a stack. The offer Fill leaf's `OP_PUSHEXPIRY` gate makes the emulator
+  look up the VTXO's expiry: fills went from p50 29 ms to 39 ms on a fresh stack. The cause is arkd's postgres event store: it loads an
   off-chain tx's events with `SELECT payload FROM watermill_offchain_tx WHERE payload->>'Id' = $1`,
   and that column has no index, so every lookup scans and parses the whole table (~9 µs per event,
   3 events per tx, about one lookup per event). At 1 461 events a lookup took 13.4 ms; with an
@@ -383,7 +384,7 @@ Before any service code, prove the covenants against the emulator and arkd on re
 
 ## 15. Spike results
 
-All 57 tests pass on a fresh regtest stack (arkd v0.9.25 with a standalone signer and postgres+redis,
+All 59 tests pass on a fresh regtest stack (arkd v0.9.25 with a standalone signer and postgres+redis,
 upstream emulator v0.0.10-rc.0, `@arkade-os/sdk` 0.5.6); see `spike/`.
 
 | §13 item | Result |
@@ -393,7 +394,7 @@ upstream emulator v0.0.10-rc.0, `@arkade-os/sdk` 0.5.6); see `spike/`.
 | 3 Floor | ✔ holds across 3 chained partial fills; `min_fill` enforced |
 | 4 Epoch bump | ✔ owner-leaf self-spend cancels all old quotes |
 | 5 Two-asset offer VTXO | ✔ fills in both directions, payments land in the change |
-| 6 Two makers, several takers | ✔ index pairing blocks shared-output attacks; 59 takers per maker, 19 makers per tx (one-direction 219-byte Fill leaves, 40-byte quote) |
+| 6 Two makers, several takers | ✔ index pairing blocks shared-output attacks; 59 takers per maker, 19 makers per tx (one-direction 230-byte Fill leaves, 40-byte quote) |
 | 7 Dust | ✔ exact sats both ways; maker never pays taker dust and vice versa |
 | 8 Swap covenant | ✔ fill at/above `min_rate` (net of fee), fee, exact-out, deadline refund, key refund, uneven amounts; Fill and Refund-anyone refuse batch intents |
 | 9 Renew leaf | ✔ exact-value renewal settles fee-free through a real batch inside the fee window; the fee-capped variant also renews sats + USD through a batch |
