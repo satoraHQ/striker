@@ -18,7 +18,7 @@ Run it on the regtest stack:
 ```sh
 npm install
 npm run regtest -- start            # arkd + emulator + explorer + arkade wallet
-npm run dev                         # funds a dev maker, starts Striker (:7080), the maker bot and the web app
+npm run dev                         # funds a dev maker, starts Striker (:7090), the maker bot and the web app
 npm run dev -- faucet <ark address> # regtest sats + $500 demo USD for a wallet to swap from
 ```
 

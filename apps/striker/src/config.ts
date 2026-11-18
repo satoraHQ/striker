@@ -40,7 +40,7 @@ export function loadConfig(): Config {
   const dataDir = path.resolve(env('STRIKER_DATA', '.striker'));
   mkdirSync(dataDir, { recursive: true });
   return {
-    port: Number(env('PORT', '7080')),
+    port: Number(env('PORT', '7090')),
     arkUrl: env('ARK_URL', 'http://localhost:7070'),
     emulatorUrl: env('EMULATOR_URL', 'http://localhost:7073'),
     esploraUrl: env('ESPLORA_URL', 'http://localhost:3000/api'),

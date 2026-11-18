@@ -1,0 +1,13 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #0b1020;
+  --color-panel: #121a2f;
+  --color-line: #22304f;
+  --color-accent: #f59e0b;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+html, body { background: var(--color-bg); color: #e5e7eb; }
+body { min-height: 100dvh; -webkit-tap-highlight-color: transparent; }
+input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; }

@@ -14,7 +14,7 @@ import { referencePrice } from './price.js';
 
 const env = (n: string, d: string) => process.env[n] ?? d;
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
-const strikerUrl = env('STRIKER_URL', 'http://localhost:7080');
+const strikerUrl = env('STRIKER_URL', 'http://localhost:7090');
 const arkUrl = env('ARK_URL', 'http://localhost:7070');
 const dataDir = path.resolve(env('MAKER_DATA', '.maker'));
 const spreadBps = Number(env('SPREAD_BPS', '50'));

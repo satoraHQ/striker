@@ -91,3 +91,6 @@ export interface SwapView {
   received?: { sats: string; asset: string };
   error?: string;
 }
+
+/** POST /v1/swaps/preview: same body as CreateSwapRequest (addresses and refundPubkey may be empty). */
+export type PreviewResponse = Pick<SwapView, 'deposit' | 'expected' | 'minimum' | 'makerPrice'>;
