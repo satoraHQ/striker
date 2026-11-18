@@ -1,7 +1,7 @@
 # v2 covenant spike
 
 Proves the covenants in `DESIGN.md` §13 against arkd + the upstream emulator on regtest.
-54/54 green on a fresh arkd **v0.9.25** (standalone signer, postgres + redis), upstream emulator
+57/57 green on a fresh arkd **v0.9.25** (standalone signer, postgres + redis), upstream emulator
 **ghcr.io/arkade-os/emulator:v0.0.10-rc.0**, `@arkade-os/sdk` **0.5.6**, arkade-regtest `7c91a6b`.
 
 ```sh
@@ -70,7 +70,7 @@ Quote: 40 bytes, `rate_num(8) ‖ rate_den(8) ‖ floor(8) ‖ min_fill(8) ‖ e
 `tag = "striker/quote/v2" ‖ maker(32) ‖ epoch(u64 LE) ‖ usd_asset(34, as the SDK serializes it: txid ‖
 u16 LE gidx) ‖ side(1)`: version, maker, epoch, asset and side are bound by the tag, so the message
 carries only the five numbers and each leaf's `SHA256(tag)` constant is what a wrong-epoch, wrong-asset or
-wrong-side quote fails against. Witness: `[signature, quote]`. Fill script (203 B per side):
+wrong-side quote fails against. Witness: `[signature, quote]`. Fill script (219 B per side):
 offchain-only gate (`"type" INSPECTINTENTMESSAGE NOT VERIFY DROP`, see the emulator findings) → tagged
 hash rebuilt in-script (`<SHA256(tag)> DUP CAT SWAP CAT SHA256 <maker> CHECKSIGFROMSTACK VERIFY`) →
 `SIZE 40 EQUALVERIFY` → `expiry BIN2NUM CHECKTIME NOT VERIFY` → the USD id (`txid gidx`) pushed once
@@ -110,12 +110,12 @@ git history before this change.
   balances but the taker's script → `input 1: … does not preserve source script`,
   i.e. the TUNNEL script check is the last line of defence. Honest 2 makers + 2 takers (one
   selling BTC, one selling USD) in one tx: 5 510 WU (was ~9 900).
-- **Size (arkd `maxTxWeight` 40 000, `txFeeRate` 0):** 1 maker + 1 taker fill 2 902–2 954 WU
+- **Size (arkd `maxTxWeight` 40 000, `txFeeRate` 0):** 1 maker + 1 taker fill 2 966–3 018 WU
   (was 5 106–5 158); each extra plain-wallet taker **630 WU** (input + sig + output + packet
-  entries); each extra maker **1 886 WU** (was 4 090: 203 B script + 104 B witness in the
+  entries); each extra maker **1 950 WU** (was 4 090: 219 B script + 104 B witness in the
   OP_RETURN at 4 WU/B, plus input and change). Measured to arkd's refusal: **1 maker + 59 takers**
-  accepted (39 446 WU), 60 refused `TX_TOO_LARGE` (was 56/57); **20 makers + 1 taker** accepted
-  (38 748 WU), 21 refused (was 9/10). The emulator's CSFS budget (50/input, 200/request) and its
+  accepted (39 510 WU), 60 refused `TX_TOO_LARGE` (was 56/57); **19 makers + 1 taker** accepted
+  (38 078 WU), 20 refused (was 9/10; 20 before the quote-field range checks added 16 B per leaf). The emulator's CSFS budget (50/input, 200/request) and its
   64 intent-gated inputs per request are not binding. The shrink came from: one leaf per side (no
   `IF/ELSE`, no second direction's arithmetic; the emulator packet carries only the executed
   leaf's script, and the 4-leaf tree costs no extra control-block bytes over the 3-leaf one);
@@ -269,8 +269,8 @@ re-running the script).
   signed, `service.go:1101`):** 1 covenant input → **228** outputs (39 844 WU). Trivial
   covenant inputs → 1 output: **85** inputs (39 964 WU, ~470 WU/input, emulator 0.9 s).
   Arkade scripts and witnesses travel in the OP_RETURN emulator packet, so they cost 4 WU/byte.
-  The 203-byte offer Fill leaf plus its 104-byte witness costs ≈ 1 230 WU on top, which comes to
-  1 886 WU per maker input and 20 maker inputs per tx (measured in `10-offer-batch.test.ts`).
+  The 219-byte offer Fill leaf plus its 104-byte witness costs ≈ 1 290 WU on top, which comes to
+  1 950 WU per maker input and 19 maker inputs per tx (measured in `10-offer-batch.test.ts`).
 - **Emulator compute limits are per input and per request** (`pkg/arkade/compute_limits.go`):
   per input `CHECKSIG*`/`CHECKSIGFROMSTACK` 50, `INSPECTINTENTMESSAGE` 16, `ECMUL` 50, etc.,
   and ×4 per request (`requestInputBudget`). Measured: a tx can have at most **64**
@@ -419,6 +419,32 @@ packet declares for j. Packet-local introspection is therefore ground truth once
 - Side note for builders: burns are free and silent. A tx that under-declares outputs loses the
   difference, with no error. The spike's `buildTx` / `split` derive the change remainder
   explicitly; Striker's tx builders must too.
+
+## Review (2026-11-18)
+
+Three independent reviews of the design and spike (Codex GPT-6.1 Terra, Claude Fable 5, Kimi K3),
+each asking whether anyone can make a maker or taker lose money. Fixed in this branch:
+
+- **Swap Fill and Refund-anyone lacked the offchain-only gate** (all three). A fill co-signed
+  as a batch intent before the deadline could be held and settled after it, at the old rate,
+  and a registered intent locks the deposit against both refund paths. Both leaves now start
+  with the gate; `20-swap` shows the emulator refusing them at the gate's `OP_VERIFY` (byte 7),
+  including an intent with an on-chain output.
+- **Quote fields ≥ 2^63 read as negative** (Kimi). The offer Fill leaf range-checks `rate_num`,
+  `rate_den`, `min_fill` (> 0) and `floor` (≥ 0); `10-offer` signs quotes with the top bit set in
+  each field and they are refused. Costs 16 B per leaf: 19 makers per tx instead of 20.
+- **`min_rate` was gross of the fee on token → BTC** (Terra). It is now net in both directions,
+  and exact-out spends `floor(want / min_rate)`, rounded in the user's favour.
+- **`planFill` rounded and branched differently from the script** (Fable, Kimi, Terra): refused
+  fills, no underpayment. Fixed, with uneven-amount and improved-rate exact-out tests.
+- **Fee-capped Renew leaf slack** (all three): exactly two proof outputs, so the slack can only
+  go to arkd as fee; `40-renew` shows an extra output being refused.
+- **The L1 exit did not show the asset** (Terra): the exit spend now carries the asset packet.
+  How those units are used afterwards is open (DESIGN.md §14).
+
+Documented rather than changed: the floor bounds one VTXO, not the offer (DESIGN.md §3); the
+real offer tree has no Renew leaf yet (prototype); Renew registrations can be griefed; the
+emulator operator's clock decides expiry; offline exit needs saved exit data (DESIGN.md §10).
 
 ## Regtest housekeeping
 

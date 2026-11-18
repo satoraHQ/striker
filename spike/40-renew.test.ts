@@ -143,6 +143,9 @@ test('renew leaf (§13 item 9): Striker renews a covenant VTXO through a batch; 
     // Deducting more than the cap is refused.
     await refused(async () => approveRenewal(chain, await renewalIntent(chain, capped, coin, striker.cosigner, preservedOutput(capped.tree, coin, 251n))),
       /opcode=OP_GREATERTHANOREQUAL .*false stack entry/);
+    // The slack under the cap may only go to arkd as fee: an extra output for whoever renews is refused.
+    await refused(async () => approveRenewal(chain, await renewalIntent(chain, capped, coin, striker.cosigner, preservedOutput(capped.tree, coin, 200n),
+      [{ script: owner.pkScript, amount: 200n }])), /OP_NUMEQUALVERIFY/);
     // Dropping the asset packet passes the covenant but not arkd.
     const burning = await renewalIntent(chain, capped, coin, striker.cosigner, { ...preservedOutput(capped.tree, coin, fee), assets: [] });
     const burningProof = await approveRenewal(chain, burning);
@@ -209,7 +212,8 @@ test('L1 exit (§13 item 11): unroll a covenant VTXO and spend the exit leaf wit
   assert.equal(status.confirmed, true, 'the ark tx holding the covenant output is confirmed');
 
   // Before the CSV delay the exit leaf is not final (the explorer hides bitcoind's reason; ask the node).
-  const early = exitSpend(covenant.tree, coin, secret(90), 1536n, bumper.address, bumper.network);
+  const held = [{ assetId: usd, amount: 7n }];
+  const early = exitSpend(covenant.tree, coin, secret(90), 1536n, bumper.address, bumper.network, 1_000n, held);
   const verdict = (JSON.parse(regtest('rpc', 'testmempoolaccept', JSON.stringify([early.hex]))) as { allowed: boolean; 'reject-reason'?: string }[])[0]!;
   t.diagnostic(`early exit: allowed=${verdict.allowed} reason=${verdict['reject-reason']}`);
   assert.equal(verdict.allowed, false);
@@ -217,8 +221,13 @@ test('L1 exit (§13 item 11): unroll a covenant VTXO and spend the exit leaf wit
 
   const target = advanceMedianTime(1536 + 60);
   t.diagnostic(`median time advanced to ${new Date(target * 1000).toISOString()}`);
-  const exit = exitSpend(covenant.tree, coin, secret(90), 1536n, bumper.address, bumper.network);
+  // The exit carries the 7 USD on to the owner's output in an asset packet (OP_RETURN extension),
+  // the same format an ark tx uses. Bitcoin accepts it; whether an L1 asset transfer is honoured
+  // afterwards (re-boarding, an L1 asset indexer) is an open question (DESIGN.md §14).
+  const exit = exitSpend(covenant.tree, coin, secret(90), 1536n, bumper.address, bumper.network, 1_000n, held);
   assert.equal(exit.inputsLength, 1);
+  assert.equal(exit.outputsLength, 2);
+  assert.equal(exit.getOutput(1).script?.[0], 0x6a, 'output 1 is the OP_RETURN asset packet');
   await explorer.broadcastTransaction(exit.hex);
   regtest('mine', '1');
   await waitFor(async () => (await explorer.getTxStatus(exit.id)).confirmed ? true : undefined, 'exit confirmation', 60_000);
@@ -229,4 +238,7 @@ test('L1 exit (§13 item 11): unroll a covenant VTXO and spend the exit leaf wit
     return v?.isUnrolled ? v : undefined;
   }, 'indexer marks the coin unrolled', 30_000).catch(() => undefined);
   t.diagnostic(`indexer isUnrolled: ${unrolled ? 'yes' : 'not reported within 30 s'}`);
+  // What arkd knows about the exit output afterwards: it only indexes coins it signed or watched.
+  const watched = await chain.indexer.getUtxos?.({ outpoints: [{ txid: exit.id, vout: 0 }] }).catch((e: unknown) => String(e));
+  t.diagnostic(`arkd getUtxos for the exit output (asset-carrying): ${JSON.stringify(watched, (_, v) => typeof v === 'bigint' ? String(v) : v)}`);
 });

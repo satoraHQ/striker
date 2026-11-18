@@ -88,6 +88,10 @@ function assetOps(id34: Uint8Array): Ops {
 }
 /** Reads an 8-byte quote field as a number; expects the quote on top, keeps it. */
 const num = (off: number): Ops => ['DUP', off, 8, 'SUBSTR', 'BIN2NUM'];
+/** Range guard for a field just read: BIN2NUM reads a set top bit as a sign, so a signed field
+ * ≥ 2^63 would be negative and void the floor, min_fill or rate check. `positive` also rejects 0. */
+const nonNegative: Ops = ['DUP', 0, 'GREATERTHANOREQUAL', 'VERIFY'];
+const positive: Ops = ['DUP', 0, 'GREATERTHAN', 'VERIFY'];
 const sats = (op: 'INSPECTINPUTVALUE' | 'INSPECTOUTPUTVALUE'): Ops => ['PUSHCURRENTINPUTINDEX', op];
 /** USD balance of this input/output. The asset id lives on the altstack as [gidx txid] (txid on
  * top); it is pulled, copied back, and consumed by the lookup. 0 when the asset is absent. */
@@ -115,12 +119,12 @@ export function fillScript(ctx: QuoteContext, side: Side): Uint8Array {
     ...assetOps(assetBytes(ctx.usd)), 'TOALTSTACK', 'TOALTSTACK',                           // USD id parked on the altstack
     // --- sold = sell_in − sell_out, with the floor on the sell-side change balance
     ...sellIn, ...sellOut, 'TUCK', 'SUB',                                                   // [q sell_out sold]
-    'SWAP', 2, 'PICK', OFF.floor, 8, 'SUBSTR', 'BIN2NUM', 'GREATERTHANOREQUAL', 'VERIFY',    // sell_out ≥ floor      → [q sold]
-    'DUP', 2, 'PICK', OFF.minFill, 8, 'SUBSTR', 'BIN2NUM', 'GREATERTHANOREQUAL', 'VERIFY',   // sold ≥ min_fill
+    'SWAP', 2, 'PICK', OFF.floor, 8, 'SUBSTR', 'BIN2NUM', ...nonNegative, 'GREATERTHANOREQUAL', 'VERIFY', // sell_out ≥ floor → [q sold]
+    'DUP', 2, 'PICK', OFF.minFill, 8, 'SUBSTR', 'BIN2NUM', ...positive, 'GREATERTHANOREQUAL', 'VERIFY', // sold ≥ min_fill > 0
     // --- received = buy_out − buy_in, then received × rate_den ≥ sold × rate_num (maker's favour)
     ...buyOut, ...buyIn, 'SUB',                                                             // [q sold received]
-    'ROT', ...num(OFF.rateDen), 'ROT', 'MUL',                                               // [sold q received×den]
-    'SWAP', OFF.rateNum, 8, 'SUBSTR', 'BIN2NUM', 'ROT', 'MUL',                              // [received×den sold×num]
+    'ROT', ...num(OFF.rateDen), ...positive, 'ROT', 'MUL',                                  // [sold q received×den]
+    'SWAP', OFF.rateNum, 8, 'SUBSTR', 'BIN2NUM', ...positive, 'ROT', 'MUL',                 // [received×den sold×num]
     'GREATERTHANOREQUAL', 'VERIFY',
     // --- change keeps this exact script (same covenant, same epoch) and every non-USD asset.
     'PUSHCURRENTINPUTINDEX', 5, 'FROMALTSTACK', 'FROMALTSTACK', 1, 'TUNNEL',

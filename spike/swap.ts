@@ -68,26 +68,40 @@ const paysFee = (script: Uint8Array): Ops => [
   'ELSE', -1, 'EQUALVERIFY', sha256(subdustScript(script)), 'EQUALVERIFY', 'ENDIF',
 ];
 
-/** Constants the fill leaf bakes in, mirrored off-chain by planFill(). */
+/** Fails when the emulator evaluates the leaf for a batch intent. Without it a fill co-signed
+ * before the deadline could be held and settled in a batch after it (arkd never re-runs the
+ * script), and a registered intent would block both refund paths. See DESIGN.md §2. */
+const offchainOnly: Ops = [new TextEncoder().encode('type'), 'INSPECTINTENTMESSAGE', 'NOT', 'VERIFY', 'DROP'];
+
+/**
+ * Constants the fill leaf bakes in, mirrored off-chain by planFill().
+ *
+ * `min_rate` is net of the fee (like Uniswap's amountOutMinimum): what the user receives per
+ * unit the user gives up, fee included. Striker quotes min_rate = maker rate × (1 − fee) ×
+ * (1 − slippage). Exact-out: the user gives up at most `maxSpend = floor(want / min_rate)`
+ * (rounded in the user's favour), so want / maxSpend ≥ min_rate.
+ */
 export function constants(t: SwapTerms) {
   const { num, den } = t.rate;
   if (num <= 0n || den <= 0n || t.feeBps < 0n || t.feeBps >= 10_000n) throw new Error('Invalid rate or fee');
   if ((t.sell === BTC) === (t.buy === BTC)) throw new Error('Spike swaps are BTC <-> one asset');
   if (t.exactOut === undefined) return {};
-  const want = t.exactOut;
+  const want = t.exactOut, maxSpend = want * den / num;
   if (t.sell === BTC) {
-    // Buy `want` tokens; pay at most maxSell sats plus a fee on maxSell.
-    const maxSell = ceilDiv(want * den, num);
-    return { maxSell, fee: feeOf(maxSell, t.feeBps) };
+    // Buy `want` tokens for at most maxSpend sats, the fee (on maxSpend) included.
+    const fee = feeOf(maxSpend, t.feeBps);
+    if (maxSpend <= fee) throw new Error('exact-out amount too small for the fee');
+    return { maxSpend, fee };
   }
-  // Buy `want` sats net; the fee is on the sats, the maker pays want + fee.
+  // Buy `want` sats net for at most maxSpend tokens; the maker pays the fee (on the sats) on top.
   if (want < t.dust) throw new Error('exact-out sats must be at least dust');
-  const fee = feeOf(want, t.feeBps);
-  return { fee, maxSell: ceilDiv((want + fee) * den, num) };
+  if (maxSpend <= 0n) throw new Error('exact-out amount too small for the rate');
+  return { maxSpend, fee: feeOf(want, t.feeBps) };
 }
 
 /**
  * Fill leaf. Failure classes (the emulator log shows the opcode):
+ *   batch intent              OP_VERIFY failed (first opcodes: the offchain-only gate)
  *   deadline passed           OP_NUMEQUALVERIFY failed
  *   wrong destination script  OP_EQUALVERIFY failed
  *   rate / receive amount     OP_VERIFY failed
@@ -98,6 +112,7 @@ export function fillScript(t: SwapTerms): Uint8Array {
   const { num, den } = t.rate, D = t.dust, bps = t.feeBps, hasFee = bps > 0n;
   const c = constants(t);
   const head: Ops = [
+    ...offchainOnly,
     t.deadline, 'CHECKTIME', 0, 'NUMEQUALVERIFY',
     ...(hasFee ? paysFee(t.feeScript) : []),          // witness: [fee_index]
     ...pays([CUR], t.receive),
@@ -117,8 +132,8 @@ export function fillScript(t: SwapTerms): Uint8Array {
       ...common,
       CUR, 'INSPECTINPUTVALUE', D, 'SUB',                             // A = deposit − carrier
       'DUP', 0, 'GREATERTHAN', 'VERIFY',
-      'DUP', bps, 'MUL', 9999, 'ADD', 10_000, 'DIV',                  // F = ceil(A·bps/1e4)
-      '2DUP', 'SUB', num, 'MUL',                                      // need = (A − F)·num
+      'DUP', bps, 'MUL', 9999, 'ADD', 10_000, 'DIV',                  // F = ceil(A·bps/1e4), out of A
+      'OVER', num, 'MUL',                                             // need = A·num (net: fee included)
       CUR, ...buy, 'INSPECTOUTASSETLOOKUP', 'DROP', den, 'MUL',       // have = tokens·den
       'LESSTHANOREQUAL', 'VERIFY', 'NIP',
       ...tail,
@@ -126,7 +141,7 @@ export function fillScript(t: SwapTerms): Uint8Array {
     return arkade.ArkadeScript.encode([
       ...common,
       CUR, ...buy, 'INSPECTOUTASSETLOOKUP', 'DROP', t.exactOut, 'GREATERTHANOREQUAL', 'VERIFY',
-      CUR, 'INSPECTINPUTVALUE', D + c.maxSell! + c.fee!, 'SUB',        // R = unused sats
+      CUR, 'INSPECTINPUTVALUE', D + c.maxSpend!, 'SUB',                // R = unused sats
       'DUP', D, 'GREATERTHANOREQUAL',
       'IF',
         ...refundIdx, 'DUP', 'INSPECTOUTPUTSCRIPTPUBKEY', 1, 'EQUALVERIFY', program(t.refund), 'EQUALVERIFY',
@@ -145,15 +160,15 @@ export function fillScript(t: SwapTerms): Uint8Array {
   if (t.exactOut === undefined) return arkade.ArkadeScript.encode([
     ...common,
     'DUP', 0, 'GREATERTHAN', 'VERIFY',
-    'DUP', num, 'MUL', den, 'DIV', bps, 'MUL', 9999, 'ADD', 10_000, 'DIV', // F on floor(U·rate)
-    CUR, 'INSPECTOUTPUTVALUE', CUR, 'INSPECTINPUTVALUE', 'SUB',        // received − own carrier
-    'OVER', 'ADD', den, 'MUL',                                         // (recv − c + F)·den
+    'DUP', num, 'MUL', den, 'DIV', bps, 'MUL', 9999, 'ADD', 10_000, 'DIV', // F on floor(U·rate), paid by the maker
+    CUR, 'INSPECTOUTPUTVALUE', CUR, 'INSPECTINPUTVALUE', 'SUB',        // net = received − own carrier
+    den, 'MUL',                                                        // net·den
     'ROT', num, 'MUL', 'GREATERTHANOREQUAL', 'VERIFY',                 //   ≥ U·num
     ...tail,
   ]);
   return arkade.ArkadeScript.encode([
     ...common,
-    c.maxSell!, 'SUB',                                                 // R = unused tokens
+    c.maxSpend!, 'SUB',                                                // R = unused tokens
     'DUP', 0, 'GREATERTHAN',
     'IF',
       ...refundIdx,
@@ -171,6 +186,7 @@ export function fillScript(t: SwapTerms): Uint8Array {
 /** Refund-anyone leaf: after the deadline, the paired output takes the whole coin to refund. */
 export function refundScript(t: SwapTerms): Uint8Array {
   return arkade.ArkadeScript.encode([
+    ...offchainOnly,
     t.deadline, 'CHECKTIME', 1, 'NUMEQUALVERIFY',
     ...pays([CUR], t.refund),
     CUR, 6, 0, 'TUNNEL',             // same value (2) and assets (4) as this input
@@ -259,33 +275,42 @@ export async function submitViaArkd(chain: Chain, spends: Spend[], outs: Out[]) 
 export interface FillPlan { receive: Out; fee?: Out; refund?: Out; feeIndexOverride?: number }
 
 /**
- * Mirrors the covenant arithmetic at the maker's actual rate (≥ min_rate). Price
- * improvement goes to the user: more of buy_asset on exact-in, a larger refund on exact-out.
+ * Mirrors the covenant arithmetic at `rate`, the user's all-in rate the filler offers (≥
+ * min_rate). Price improvement goes to the user: more of buy_asset on exact-in, a smaller spend
+ * on exact-out. Amounts are rounded so the covenant's own (min_rate) check always passes, and
+ * exact-out branches on the covenant's remainder, not the planned one.
  */
 export function planFill(swap: Swap, coin: CoinLike, rate = swap.terms.rate): FillPlan {
   const t = swap.terms, D = t.dust, c = constants(t);
+  if (rate.num * t.rate.den < t.rate.num * rate.den) throw new Error('Rate below min_rate');
   const fee = (sats: bigint): Out | undefined => t.feeBps > 0n
     ? { script: sats < D ? subdustScript(t.feeScript) : t.feeScript, amount: sats } : undefined;
+  /** buy units for `x` sell units: floor at `rate`, but never below the covenant's ceil at min_rate. */
+  const atLeast = (x: bigint) => {
+    const offered = x * rate.num / rate.den, needed = ceilDiv(x * t.rate.num, t.rate.den);
+    return offered > needed ? offered : needed;
+  };
   const S = BigInt(coin.value);
   if (t.sell === BTC) {
     if (t.exactOut === undefined) {
-      const A = S - D, F = feeOf(A, t.feeBps);
-      return { receive: { script: t.receive, amount: D, assets: { [t.buy]: ceilDiv((A - F) * rate.num, rate.den) } }, fee: fee(F) };
+      const A = S - D;
+      return { receive: { script: t.receive, amount: D, assets: { [t.buy]: atLeast(A) } }, fee: fee(feeOf(A, t.feeBps)) };
     }
-    const sold = ceilDiv(t.exactOut * rate.den, rate.num), R = S - D - sold - c.fee!;
+    const spend = t.exactOut * rate.den / rate.num, R = S - D - spend;   // spend ≤ maxSpend, fee included
+    if (R < 0n) throw new Error('Deposit too small for the exact-out amount');
     return { receive: { script: t.receive, amount: D, assets: { [t.buy]: t.exactOut } }, fee: fee(c.fee!),
-      ...(R >= D ? { refund: { script: t.refund, amount: R } } : {}) };
+      ...(R >= D ? { refund: { script: t.refund, amount: R } } : {}) };   // a sub-dust remainder stays with the maker
   }
   const U = assetsOf(coin)[t.sell] ?? 0n;
-  if (t.exactOut === undefined) {
-    const F = feeOf(U * t.rate.num / t.rate.den, t.feeBps);
-    const gross = U * rate.num / rate.den;
-    return { receive: { script: t.receive, amount: S + gross - F }, fee: fee(F) };
+  if (t.exactOut === undefined)
+    return { receive: { script: t.receive, amount: S + atLeast(U) }, fee: fee(feeOf(U * t.rate.num / t.rate.den, t.feeBps)) };
+  // The covenant takes the token-change branch iff U > maxSpend; the plan must match it.
+  if (U > c.maxSpend!) {
+    const sold = ceilDiv(t.exactOut * rate.den, rate.num), keep = U - (sold < c.maxSpend! ? sold : c.maxSpend!);
+    return { receive: { script: t.receive, amount: S - D + t.exactOut }, fee: fee(c.fee!),
+      refund: { script: t.refund, amount: D, assets: { [t.sell]: keep } } };
   }
-  const sold = ceilDiv((t.exactOut + c.fee!) * rate.den, rate.num), R = U - sold;
-  return R > 0n
-    ? { receive: { script: t.receive, amount: S - D + t.exactOut }, fee: fee(c.fee!), refund: { script: t.refund, amount: D, assets: { [t.sell]: R } } }
-    : { receive: { script: t.receive, amount: S + t.exactOut }, fee: fee(c.fee!) };
+  return { receive: { script: t.receive, amount: S + t.exactOut }, fee: fee(c.fee!) };   // the user sells all U ≤ maxSpend
 }
 
 const add = (a: Record<string, bigint>, b: Record<string, bigint> = {}, sign = 1n) => {

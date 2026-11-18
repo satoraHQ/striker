@@ -50,11 +50,13 @@ export function registerMessage(cosigner: string, expireAt = 0): Proof.RegisterM
  * signed proof to the caller; it does not register it with arkd.
  */
 export async function emulatorSignedIntent(chain: Chain, coin: VirtualCoin, tree: VtxoScript, script: Uint8Array,
-  outputs: TransactionOutput[], message: Proof.RegisterMessage) {
-  const leaf = leafOf(tree);
+  outputs: TransactionOutput[], message: Proof.RegisterMessage, opts: { leaf?: number; witness?: Uint8Array[] } = {}) {
+  const leaf = tree.leaves[opts.leaf ?? 0];
+  if (!leaf) throw new Error('Missing covenant leaf');
   const [withPrev] = await withPrevTxs([{ ...coin, tapTree: tree.encode(), proofTapLeafScript: leaf, forfeitTapLeafScript: leaf }], chain.indexer);
   // Proof input 0 is the BIP322 message input; the covenant coin is input 1.
-  const proof = Proof.create(message, [withPrev!], [...outputs, emulatorOutput([{ vin: 1, script }])]);
+  const packet = Extension.create([EmulatorPacket.create([{ vin: 1, script, witness: RawWitness.encode(opts.witness ?? []) }])]).txOut();
+  const proof = Proof.create(message, [withPrev!], [...outputs, packet]);
   return { proof: await chain.emulator.submitIntent({ proof: b64(proof.toPSBT()), message }), message };
 }
 

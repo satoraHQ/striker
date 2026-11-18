@@ -50,6 +50,9 @@ export function renewScript({ cosigner, window, maxFee }: RenewLeafOptions): Uin
     'PUSHCURRENTINPUTINDEX', '1SUB', preserved, 0, 'TUNNEL',
     ...(maxFee === undefined ? [] : [
       'VERIFY',
+      // Exactly two proof outputs (the renewed VTXO and the extension carrying the packets), so the
+      // up-to-maxFee slack can only go to arkd as fee, never to an extra output of whoever renews.
+      'INSPECTNUMOUTPUTS', 2, 'NUMEQUALVERIFY',
       'PUSHCURRENTINPUTINDEX', '1SUB', 'INSPECTOUTPUTVALUE',
       'PUSHCURRENTINPUTINDEX', 'INSPECTINPUTVALUE', maxFee, 'SUB',
       'GREATERTHANOREQUAL',
@@ -81,7 +84,8 @@ export interface RenewalIntent {
  * Renew leaf. Input 1 (the VTXO) carries the funding ark tx for OP_TUNNEL and
  * the emulator packet; `output` becomes proof output 0.
  */
-export async function renewalIntent(chain: Chain, covenant: RenewableCovenant, coin: VirtualCoin, cosigner: string, output: RenewalOutput): Promise<RenewalIntent> {
+export async function renewalIntent(chain: Chain, covenant: RenewableCovenant, coin: VirtualCoin, cosigner: string, output: RenewalOutput,
+  extra: { script: Uint8Array; amount: bigint }[] = []): Promise<RenewalIntent> {
   const prevTx = (await resolvePrevTxs([coin.txid], chain.indexer)).get(coin.txid);
   if (!prevTx) throw new Error('Missing funding ark tx');
   const leaf = covenant.tree.leaves[RENEW_LEAF]!;
@@ -94,7 +98,7 @@ export async function renewalIntent(chain: Chain, covenant: RenewableCovenant, c
       [asset.AssetInput.create(1, BigInt(coin.assets!.find(c => c.assetId === a.assetId)!.amount))], [asset.AssetOutput.create(0, a.amount)], [])))] : []),
     EmulatorPacket.create([{ vin: 1, script: covenant.renew, witness: RawWitness.encode([]) }]),
   ];
-  const proof = Proof.create(message, [input], [{ script: output.script, amount: output.amount }, Extension.create(packets).txOut()]);
+  const proof = Proof.create(message, [input], [{ script: output.script, amount: output.amount }, ...extra, Extension.create(packets).txOut()]);
   return { proof, message, input };
 }
 
@@ -183,11 +187,14 @@ export async function unrollToL1(chain: Chain, coin: { txid: string; vout: numbe
 
 /** Builds and signs the exit-leaf spend (owner key + CSV) of an unrolled covenant output. */
 export function exitSpend(tree: VtxoScript, coin: { txid: string; vout: number; value: number }, ownerSecret: Uint8Array, exitDelay: bigint,
-  to: string, network: Network, fee = 1_000n) {
+  to: string, network: Network, fee = 1_000n, assets: { assetId: string; amount: bigint }[] = []) {
   const tx = new Transaction({ version: 2 });
   tx.addInput({ txid: coin.txid, index: coin.vout, witnessUtxo: { script: tree.pkScript, amount: BigInt(coin.value) },
     tapLeafScript: [tree.leaves[EXIT_LEAF]!], sequence: timelockToSequence({ type: 'seconds', value: exitDelay }), sighashType: SigHash.DEFAULT });
   tx.addOutputAddress(to, BigInt(coin.value) - fee, network);
+  // Carry the coin's assets on to output 0 with the same packet format an ark tx uses.
+  if (assets.length) tx.addOutput(Extension.create([asset.Packet.create(assets.map(a => asset.AssetGroup.create(
+    asset.AssetId.fromString(a.assetId), null, [asset.AssetInput.create(0, a.amount)], [asset.AssetOutput.create(0, a.amount)], [])))]).txOut());
   if (!tx.signIdx(ownerSecret, 0)) throw new Error('Owner key did not sign the exit leaf');
   tx.finalize();
   return tx;

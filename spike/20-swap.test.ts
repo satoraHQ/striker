@@ -1,9 +1,10 @@
 // Spike items 7 (taker dust) and 8 (swap covenant). Keys 60–79.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { connect, disposeWallets, fundedWallet, issueDemoUsd, publicKey, refused, rejectedWith, secret } from './harness.js';
+import { connect, disposeWallets, fundedWallet, hex, issueDemoUsd, publicKey, refused, rejectedWith, secret } from './harness.js';
 import { SingleKey } from '@arkade-os/sdk';
-import { BTC, deposit, fill, fillMany, outputAt, planFill, submitViaArkd, submitViaEmulator, swapCovenant, swapSpend, type SwapTerms } from './swap.js';
+import { emulatorSignedIntent, registerMessage } from './emulator-behaviour.js';
+import { BTC, LEAF, deposit, fill, fillMany, num, outputAt, planFill, submitViaArkd, submitViaEmulator, swapCovenant, swapSpend, type SwapTerms } from './swap.js';
 
 // $100,000 / BTC with an 8-decimal USD: 1 sat = 100_000 USD base units.
 const BTC_USD = { num: 100_000n, den: 1n };
@@ -13,6 +14,7 @@ const usdOf = (v: { assets?: { assetId: string; amount: unknown }[] }, id: strin
   BigInt(String(v.assets?.find(a => a.assetId === id)?.amount ?? 0));
 /** Covenant refusal whose emulator error names the failing check (see `fillScript`'s failure classes). */
 const refusedWith = (text: string, fn: () => Promise<unknown>) => refused(fn, text);
+const note = (what: string, message: string) => console.log(`  ${what}: ${message.slice(0, 200)}`);
 
 test('swap covenant (DESIGN §5) and taker dust (§6)', { timeout: 900_000 }, async t => {
   t.after(disposeWallets);
@@ -38,7 +40,7 @@ test('swap covenant (DESIGN §5) and taker dust (§6)', { timeout: 900_000 }, as
     const plan = planFill(swap, coin);
     const A = 200_123n - D, F = (A * 30n + 9_999n) / 10_000n;
     assert.equal(plan.fee!.amount, F);
-    assert.equal(plan.receive.assets![usd], (A - F) * 100_000n);
+    assert.equal(plan.receive.assets![usd], A * 100_000n, 'min_rate is net of the fee: every sold sat counts');
 
     const below = { ...plan, receive: { ...plan.receive, assets: { [usd]: plan.receive.assets![usd]! - 1n } } };
     await refusedWith('OP_VERIFY failed', () => fill(chain, swap, coin, maker, below));
@@ -51,7 +53,7 @@ test('swap covenant (DESIGN §5) and taker dust (§6)', { timeout: 900_000 }, as
     const { txid } = await fill(chain, swap, coin, maker, plan);
     const got = await outputAt(chain, txid, 0);
     assert.equal(BigInt(got.value), D, 'receive carries exactly the taker-funded dust');
-    assert.equal(usdOf(got, usd), (A - F) * 100_000n);
+    assert.equal(usdOf(got, usd), A * 100_000n);
     const fee = await outputAt(chain, txid, 2);
     assert.equal(BigInt(fee.value), F);
   });
@@ -73,17 +75,18 @@ test('swap covenant (DESIGN §5) and taker dust (§6)', { timeout: 900_000 }, as
     assert.equal(usdOf(coin, usd), U);
     const plan = planFill(swap, coin);
     const F = (1_000_000n * 30n + 9_999n) / 10_000n;
-    assert.equal(plan.receive.amount, D + 1_000_000n - F);
+    assert.equal(plan.receive.amount, D + 1_000_000n, 'net of the fee, which the maker pays on top');
+    assert.equal(plan.fee!.amount, F);
     const below = { ...plan, receive: { ...plan.receive, amount: plan.receive.amount - 1n } };
     await refusedWith('OP_VERIFY failed', () => fill(chain, swap, coin, maker, below));
     const { txid } = await fill(chain, swap, coin, maker, plan);
-    assert.equal(BigInt((await outputAt(chain, txid, 0)).value), D + 1_000_000n - F);
+    assert.equal(BigInt((await outputAt(chain, txid, 0)).value), D + 1_000_000n);
 
     const coin2 = await deposit(chain, user, swap, Number(D), [{ assetId: usd, amount: U }]);
     const better = planFill(swap, coin2, { num: 101n, den: 10_000_000n });
-    assert.equal(better.receive.amount, D + 1_010_000n - F);
+    assert.equal(better.receive.amount, D + 1_010_000n);
     const { txid: txid2 } = await fill(chain, swap, coin2, maker, better);
-    assert.equal(BigInt((await outputAt(chain, txid2, 0)).value), D + 1_010_000n - F);
+    assert.equal(BigInt((await outputAt(chain, txid2, 0)).value), D + 1_010_000n);
   });
 
   await t.test('exact-out BTC→USD: unused sats return to refund_address in the fill', async () => {
@@ -91,7 +94,8 @@ test('swap covenant (DESIGN §5) and taker dust (§6)', { timeout: 900_000 }, as
     const swap = swapCovenant(chain, terms({ exactOut: want }));
     const coin = await deposit(chain, user, swap, 600_000);   // the user overpays
     const plan = planFill(swap, coin);
-    const F = 1_500n, R = 600_000n - D - 500_000n - F;
+    const R = 600_000n - D - 500_000n;                // at most 500 000 sats spent, the 1 500-sat fee included
+    assert.equal(plan.fee!.amount, 1_500n);
     assert.equal(plan.refund!.amount, R);
     const short = { ...plan, refund: { ...plan.refund!, amount: R - 1n } };
     await refusedWith('script returned early', () => fill(chain, swap, coin, maker, short));
@@ -108,7 +112,8 @@ test('swap covenant (DESIGN §5) and taker dust (§6)', { timeout: 900_000 }, as
     const U = 3_000n * 100_000_000n;
     const coin = await deposit(chain, user, swap, Number(D), [{ assetId: usd, amount: U }]);
     const plan = planFill(swap, coin);
-    const F = 600n, sold = (want + F) * 100_000n;
+    const sold = want * 100_000n;                      // the 600-sat fee comes from the maker on top
+    assert.equal(plan.fee!.amount, 600n);
     assert.equal(plan.receive.amount, want);           // carrier moved to the token change
     assert.deepEqual(plan.refund!.assets, { [usd]: U - sold });
     const { txid } = await fill(chain, swap, coin, maker, plan);
@@ -192,6 +197,64 @@ test('swap covenant (DESIGN §5) and taker dust (§6)', { timeout: 900_000 }, as
     assert.equal(usdOf(await outputAt(chain, txid, 1), usd), pb.receive.assets![usd]);
   });
 
+  await t.test('uneven amounts and rates: the planner rounds the way the covenant does', async () => {
+    // BTC→USD and USD→BTC exact-in at rates with a remainder (den > 1), and ragged deposits.
+    const btc = swapCovenant(chain, terms({ rate: { num: 700_443n, den: 7n } }));
+    const sats = await deposit(chain, user, btc, 123_457);
+    const p1 = planFill(btc, sats);
+    assert.notEqual((123_457n - D) * 700_443n % 7n, 0n, 'not an exact product');
+    const below = { ...p1, receive: { ...p1.receive, assets: { [usd]: p1.receive.assets![usd]! - 1n } } };
+    await refusedWith('OP_VERIFY failed', () => fill(chain, btc, sats, maker, below));
+    assert.ok((await fill(chain, btc, sats, maker, p1)).txid);
+
+    const tok = swapCovenant(chain, terms({ sell: usd, buy: BTC, rate: { num: 1n, den: 99_937n } }));
+    const U = 123_456_789_011n;
+    const coin = await deposit(chain, user, tok, Number(D), [{ assetId: usd, amount: U }]);
+    const p2 = planFill(tok, coin);
+    assert.notEqual(U % 99_937n, 0n, 'not an exact product');
+    const short = { ...p2, receive: { ...p2.receive, amount: p2.receive.amount - 1n } };
+    await refusedWith('OP_VERIFY failed', () => fill(chain, tok, coin, maker, short));
+    assert.ok((await fill(chain, tok, coin, maker, p2)).txid);
+  });
+
+  await t.test('exact-out USD→BTC at an improved rate with U = max spend: no token change', async () => {
+    // The covenant branches on U − maxSpend (here 0: no change output), not on what the filler sells.
+    const want = 200_000n;
+    const swap = swapCovenant(chain, terms({ sell: usd, buy: BTC, rate: USD_BTC, exactOut: want }));
+    const U = want * 100_000n;                         // exactly maxSpend
+    const coin = await deposit(chain, user, swap, Number(D), [{ assetId: usd, amount: U }]);
+    const plan = planFill(swap, coin, { num: 101n, den: 10_000_000n });
+    assert.equal(plan.refund, undefined);
+    assert.equal(plan.receive.amount, D + want);
+    const { txid } = await fill(chain, swap, coin, maker, plan);
+    assert.equal(BigInt((await outputAt(chain, txid, 0)).value), D + want);
+  });
+
+  await t.test('offchain only: the fill and refund leaves refuse batch intents', async () => {
+    // Without the gate a fill co-signed before the deadline could be held and settled after it,
+    // and a registered intent would block both refund paths (DESIGN.md §2, §5).
+    const swap = swapCovenant(chain, terms({ deadline: now() + 10n }));
+    const coin = await deposit(chain, user, swap, 50_000);
+    const cosigner = '02' + hex(publicKey(64));
+    const gate = /opcode=OP_VERIFY position=7: /;   // the gate's VERIFY (byte 7), before any other check
+    const outs = [{ script: user.pkScript, amount: 50_000n }];
+    // Before the deadline: a fill intent (fee index witness as an offchain fill would carry).
+    const fillGate = await refused(() => emulatorSignedIntent(chain, coin, swap.tree, swap.fill, outs, registerMessage(cosigner),
+      { leaf: LEAF.fill, witness: [num(0)] }), gate);
+    note('swap fill via intent', fillGate.message);
+    while (now() <= swap.terms.deadline + 1n) await new Promise(r => setTimeout(r, 1000));
+    // After the deadline: refund-anyone, as a plain register intent and with an on-chain output
+    // (which arkd moves into the commitment tx, shifting the VTXO outputs' indexes).
+    for (const message of [registerMessage(cosigner), { ...registerMessage(cosigner), onchain_output_indexes: [0] }]) {
+      const r = await refused(() => emulatorSignedIntent(chain, coin, swap.tree, swap.refund, outs, message,
+        { leaf: LEAF.refundAnyone }), gate);
+      note(`swap refund via intent (onchain ${JSON.stringify(message.onchain_output_indexes)})`, r.message);
+    }
+    // The offchain refund still works.
+    const txid = await submitViaEmulator(chain, [swapSpend(swap, coin, 'refundAnyone')], outs);
+    assert.equal(BigInt((await outputAt(chain, txid, 0)).value), 50_000n);
+  });
+
   await t.test('taker dust (§13 item 7): sell all but dust, buy back with the whole token VTXO', async () => {
     const holder = await fundedWallet(chain, 62, 0);           // only ever holds the bought token VTXO
     const S = 200_000n;
@@ -200,7 +263,8 @@ test('swap covenant (DESIGN §5) and taker dust (§6)', { timeout: 900_000 }, as
     const p1 = planFill(buy, coin), F1 = p1.fee!.amount;
     const { txid } = await fill(chain, buy, coin, maker, p1);
     const tokenVtxo = await outputAt(chain, txid, 0);
-    const X = (S - D - F1) * 100_000n;
+    const X = (S - D) * 100_000n;
+    assert.ok(F1 > 0n);
     assert.equal(BigInt(tokenVtxo.value), D);
     assert.equal(usdOf(tokenVtxo, usd), X);
 
@@ -208,13 +272,15 @@ test('swap covenant (DESIGN §5) and taker dust (§6)', { timeout: 900_000 }, as
     const sell = swapCovenant(chain, terms({ sell: usd, buy: BTC, rate: USD_BTC, receive: holder.pkScript, refund: holder.pkScript }));
     const coin2 = await deposit(chain, holder, sell, Number(D), [{ assetId: usd, amount: X }]);
     assert.equal(BigInt(coin2.value), D, 'the whole token VTXO moved, carrier included');
-    const p2 = planFill(sell, coin2), F2 = p2.fee!.amount;
-    assert.equal(p2.receive.amount, S - F1 - F2, 'own dust back on top of the bought sats');
+    const p2 = planFill(sell, coin2);
+    assert.ok(p2.fee!.amount > 0n);
+    // At min_rate = the maker's rate both fees fall on the maker, so the user ends with exactly S.
+    assert.equal(p2.receive.amount, S, 'own dust back on top of the bought sats');
     // Maker funds its USD carrier from the taker's dust: refused.
     const makerTakesDust = { ...p2, receive: { ...p2.receive, amount: p2.receive.amount - D } };
     await refusedWith('OP_VERIFY failed', () => fill(chain, sell, coin2, maker, makerTakesDust));
     const { txid: txid2 } = await fill(chain, sell, coin2, maker, p2);
-    assert.equal(BigInt((await outputAt(chain, txid2, 0)).value), S - F1 - F2);
+    assert.equal(BigInt((await outputAt(chain, txid2, 0)).value), S);
     assert.equal(BigInt((await outputAt(chain, txid2, 1)).value) >= D, true);
   });
 });

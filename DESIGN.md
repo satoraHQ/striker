@@ -63,10 +63,13 @@ Every covenant VTXO follows the emulator's dual-VM model:
 - **Covenant leaves are exactly `[server, emulator]`.** If any other key comes after the
   emulator key, the emulator is not the finalizer and hands its signatures back to the caller,
   who can then submit them to arkd after a quote has expired.
-- **Every Fill leaf is offchain-only.** It starts with `"type" OP_INSPECTINTENTMESSAGE OP_NOT
-  OP_VERIFY OP_DROP`. Without this gate, an intent proof signed before expiry can be settled
-  in a batch at any later time, because the batch path never re-runs the script. Offchain
-  fills are validated, signed, submitted and finalized in a single emulator `SubmitTx` call.
+- **Every covenant leaf except Renew is offchain-only:** the offer Fill leaves and the swap
+  Fill and Refund-anyone leaves. Each starts with `"type" OP_INSPECTINTENTMESSAGE OP_NOT
+  OP_VERIFY OP_DROP`. Without this gate, an intent proof signed before expiry (or a deadline)
+  can be held and settled in a batch at any later time, because the batch path never re-runs
+  the script; merely registering it also locks the VTXO against every other spend. Offchain
+  spends are validated, signed, submitted and finalized in a single emulator `SubmitTx` call.
+  The first review missed this on the swap covenant; `20-swap` now checks both leaves.
 
 ## 3. Signed quote
 
@@ -91,8 +94,18 @@ tag = "striker/quote/v2" ‖ maker_pubkey(32) ‖ epoch(u64 LE) ‖ asset_id(34)
 - Fields stay u64: a u32 expiry would stop working in 2038 (BIN2NUM reads the top bit as a
   sign), and u32 rate or amount fields would cap rates and balances for other asset decimals;
   the saving would be 16–32 WU per maker input.
+- Fields are u63 in practice: BIN2NUM reads a set top bit as a sign, and a negative floor,
+  `min_fill` or rate would void its check (a negative `rate_num` sells for nothing). The
+  signer refuses such values and the Fill leaf range-checks each field (`rate_num`, `rate_den`,
+  `min_fill` > 0, `floor` ≥ 0; a negative expiry already fails), so a third-party signer that
+  skips the rule can't be filled on such a quote.
 - **Floor instead of maximum.** "Up to X" could be reused on every chained change VTXO. A
-  fixed balance floor caps the total across any chain of partial fills with no extra state.
+  balance floor bounds what a chain of partial fills can take from *one* VTXO, with no extra
+  state. It is not a cumulative cap: two VTXOs at the same offer address can each be filled
+  down to the floor, and a fill in the other direction refills the balance, after which the
+  same quote applies again. Every fill is still at the maker's signed rate. The maker bot keeps
+  one VTXO per offer address (consolidating through the Owner leaf, or bumping the epoch, before
+  quoting after a deposit) and sizes quotes against that one balance.
 - **Expiry.** `<expiry> OP_CHECKTIME OP_NOT OP_VERIFY` means "valid only before expiry",
   judged by the emulator host's wall clock. The emulator already co-signs every spend, so this
   adds no new trust. It holds only together with the offchain-only gate (§2).
@@ -113,7 +126,7 @@ funds new dust, and proceeds can immediately back offers on the other side.
 | Fill sell-BTC | Valid quote for this side (signature over the side's tag, expiry) + the fill rules below |
 | Fill sell-asset | Same, the other direction |
 | Owner | Maker key: withdraw, re-price, epoch bump |
-| Renew | Anyone (Striker as delegate): batch registration only, script and value preserved |
+| Renew | Anyone (Striker as delegate): batch registration only, script and value preserved. Proven on a separate test covenant; the prototype adds it to the offer tree. |
 | Exit (L1) | Maker key + CSV |
 
 **Fill rules** for maker input `i`, change at its paired output (fixed index pairing, so two
@@ -125,6 +138,7 @@ sold     = input.sell_bal − change.sell_bal
 received = change.buy_bal − input.buy_bal
 sold     ≥ quote.min_fill
 received × rate_den ≥ sold × rate_num            // rounded in the maker's favour
+rate_num, rate_den, min_fill > 0; floor ≥ 0      // range checks (fields are u63)
 change.sell_bal ≥ quote.floor
 all other assets preserved exactly            // OP_TUNNEL flags 5, traded token excepted
 ```
@@ -135,7 +149,7 @@ all other assets preserved exactly            // OP_TUNNEL flags 5, traded token
 - `OP_INSPECT*ASSET*` take the asset txid byte-reversed relative to the SDK's `AssetId.txid`.
 - One Fill leaf per side: the emulator packet carries only the executed leaf's script, so each
   leaf holds one direction's arithmetic and the asset id once (parked on the altstack for the
-  two lookups and the `OP_TUNNEL` exception). Each Fill leaf in the spike is 203 bytes with a
+  two lookups and the `OP_TUNNEL` exception). Each Fill leaf in the spike is 219 bytes with a
   104-byte witness (was one 644-byte two-direction leaf with a 212-byte witness). Owner leaf
   `[maker, arkd]` (epoch bump and withdrawal need no emulator). Exit leaf maker + CSV 1536 s.
 
@@ -149,22 +163,29 @@ A deposit address made for one order. The user pays it from any Ark wallet (e.g.
 arkade.money, which sends both BTC and assets).
 
 Parameters: `receive_address`, `refund_address`, `fee_address`, `sell_asset`, `buy_asset`,
-`min_rate` (buy units per sell unit: quoted rate minus slippage), `fee_bps`, `deadline`
-(≈ 10 min), `refund_pubkey`, optional `want` (exact-out amount).
+`min_rate` (buy units per sell unit, **net of the fee**), `fee_bps`, `deadline` (≈ 10 min),
+`refund_pubkey`, optional `want` (exact-out amount).
+
+- `min_rate` works like Uniswap's `amountOutMinimum`: it is what the user gets per unit given
+  up, fee included. Striker sets `min_rate = maker_rate × (1 − fee) × (1 − slippage)`.
 
 - Output positions: swap input `i` of `n` pays receive at output `i` and any exact-out refund at
   `i + n`. The fee output index is the only witness item.
-- The fee is in sats: `ceil((input − D) · bps)` for BTC → token, taken from the deposit, and
-  `ceil(floor(U · min_rate) · bps)` for token → BTC, taken from the bought sats.
+- The fee is in sats: `ceil((input − D) · bps)` for BTC → token, taken out of the deposit, and
+  `ceil(floor(U · min_rate) · bps)` for token → BTC, paid by the maker on top of the user's sats.
+  Either way the user's side of the check is net: `tokens ≥ (input − D) · min_rate`, or
+  `sats received ≥ U · min_rate`.
 - A fee below 330 sats must go to the fee key's `OP_RETURN <key>` sub-dust form; arkd
   rejects other outputs below dust.
-- Exact-out fixes the maximum sell amount and the fee in the script. A BTC remainder below dust
-  is forfeited. A deposit that is too small can't fill and refunds after the deadline.
+- Exact-out fixes `max_spend = floor(want / min_rate)` (rounded in the user's favour, fee
+  included on the BTC side) and the fee in the script. A BTC remainder below dust is forfeited.
+  A deposit below `max_spend` only fills if a maker accepts the better rate; otherwise it refunds
+  after the deadline.
 
 | Leaf | Spend condition |
 |---|---|
-| Fill | Before the deadline. The output to `receive_address` carries ≥ `input × min_rate` of `buy_asset` (net of fee), plus dust funded from the input. Exact-out orders return unused input to `refund_address` in the same transaction. |
-| Refund (anyone) | After the deadline (`OP_CHECKTIME`). Everything goes to `refund_address`. |
+| Fill | Offchain only, before the deadline. The output to `receive_address` carries ≥ `input × min_rate` of `buy_asset` (net of fee), plus dust funded from the input. Exact-out orders return unused input to `refund_address` in the same transaction. |
+| Refund (anyone) | Offchain only, after the deadline (`OP_CHECKTIME`). Everything goes to `refund_address`. |
 | Refund (key) | `[refund_pubkey, arkd]`, any time: the user cancels. No emulator needed. |
 | Exit (L1) | `refund_pubkey` + CSV |
 
@@ -207,10 +228,10 @@ it out (§4).
   each sign the final transaction. If someone misses the signing timeout, the batch is
   rebuilt without them.
 - Batch size is bounded by arkd's `maxTxWeight` (40 000 WU), checked after the emulator
-  signs. Measured with the spike scripts: **1 maker + 59 takers**, or **20 makers + 1 taker**,
-  per tx. Each maker input costs ≈ 1 886 WU (the 203-byte Fill leaf and 104-byte witness travel
+  signs. Measured with the spike scripts: **1 maker + 59 takers**, or **19 makers + 1 taker**,
+  per tx. Each maker input costs ≈ 1 950 WU (the 219-byte Fill leaf and 104-byte witness travel
   in the OP_RETURN emulator packet at 4 WU/byte, plus input and change), each plain-wallet taker
-  ≈ 630 WU; a 1 maker + 1 taker fill is ~2 950 WU. The emulator also caps a request at 64
+  ≈ 630 WU; a 1 maker + 1 taker fill is ~3 000 WU. The emulator also caps a request at 64
   intent-gated inputs and 200 `OP_CHECKSIGFROMSTACK` checks, neither of which binds.
 - One emulator `SubmitTx` (script, sign, arkd submit and finalize) takes p50 22–30 ms (p95 25–34 ms)
   for a single-input self-spend on a fresh arkd v0.9.25 stack, flat with chain depth. On a stack
@@ -243,6 +264,11 @@ based on the emulator's non-interactive delegate pattern (`test/delegate_test.go
   That key must be stable: rotating it means every owner re-deposits. SDK ≥ 0.5.4 exports a
   deterministic `TreeSignerSession` (constructed from a secret), so the pinned key is stable;
   a fresh session is still built per batch, since musig2 nonces must never be reused.
+- The Renew leaf is anyone-callable: the intent message only has to name Striker's cosigner
+  key, which is public. Anyone can therefore register a faithful renewal they can't complete
+  and so lock a covenant VTXO against fills until the round fails. Funds can't move (OP_TUNNEL
+  pins everything); Striker watches for registrations naming its key and completes them, which
+  caps the lock at one round.
 - Striker acts as delegate and renews offer covenants before expiry, and also after N fills,
   since renewal resets chain depth to 1 and keeps L1 exits cheap. Swap covenants are short-lived and normally settle or
   refund before needing renewal.
@@ -253,7 +279,9 @@ based on the emulator's non-interactive delegate pattern (`test/delegate_test.go
   (checked against `/v1/info`, 2026-11-17). So Striker renews only within the last W seconds
   before expiry, and `OP_TUNNEL`'s exact-value rule holds. Striker reads the fee program at
   runtime and skips renewal if it would cost anything.
-- **Fallback: a fee-capped Renew leaf** (`OP_TUNNEL` flags 5 plus `out.value ≥ in.value − maxFee`).
+- **Fallback: a fee-capped Renew leaf** (`OP_TUNNEL` flags 5 plus `out.value ≥ in.value − maxFee`,
+  and exactly two proof outputs so the slack can only go to arkd as fee, never to an extra
+  output of whoever renews; anyone can still make a renewal overpay arkd by up to `maxFee`).
   arkd's fee is `Σin − Σout`, so an exact-value renewal fails as soon as a server charges
   anything (spike: `INTENT_INSUFFICIENT_FEE … got 0 min expected 200`). A change to the fee
   program would otherwise strand covenant VTXOs. The spike renewed a sats + USD covenant through
@@ -270,12 +298,13 @@ the transaction the taker signs.
 | Risk | Protected by | Trust in Striker |
 |---|---|---|
 | Theft, over-fill, wrong asset, underpayment | Covenant + quote signature | None |
-| Filling an expired quote | `OP_CHECKTIME` (emulator clock) | None |
+| Filling an expired quote | `OP_CHECKTIME` (emulator clock) | None in Striker; the emulator operator's clock decides expiry and deadlines |
 | Filling a superseded but unexpired quote | Striker policy | **Bounded by quote lifetime** |
 | Emergency cancel | Owner leaf epoch bump or withdraw | None |
 | Price improvement kept by Striker | Visible in witness, checked by the web app | Execution quality only |
 | Striker or emulator offline | Swap refunds after the deadline; owner leaves | Liveness only |
-| Arkade offline | L1 exit leaves (owner key + CSV) | None |
+| Arkade offline | L1 exit leaves (owner key + CSV) | None, if the owner saved the exit data (the VTXO's virtual-tx ancestry) while Arkade was up; the SDK's exit-data capture does this, the spike's exit fetched it from the indexer. Assets on L1: open (§14) |
+| arkd changes its fee program or dust limit | L1 exit leaves | Exact-value spends (fills, refunds, renewals) stop working until covenants are rebuilt; funds stay recoverable |
 | Asset amounts forged, omitted or over-claimed in a tx | arkd asset validation: each input's packet claims must equal the VTXO's assets exactly (`OP_TUNNEL` and asset introspection only see the tx's own packet) | None in Striker; trust in arkd |
 
 arkd checks the packet against the spent VTXOs in both directions (spike `50-asset-claims`).
@@ -337,10 +366,14 @@ Before any service code, prove the covenants against the emulator and arkd on re
 - Signing-round timeout for direct-fill batching.
 - Default quote lifetime for maker bots.
 - External wallet signing API.
+- Assets after an L1 exit. The exit spend can carry the asset packet on to the owner's output
+  (`40-renew` does), and Bitcoin accepts it, but nothing in the stack indexes L1 asset
+  transfers (arkd only tracks coins it signed or watched), so it is unclear how the owner
+  would use or re-board those units. Needs an answer from Arkade before mainnet.
 
 ## 15. Spike results
 
-All 54 tests pass on a fresh regtest stack (arkd v0.9.25 with a standalone signer and postgres+redis,
+All 57 tests pass on a fresh regtest stack (arkd v0.9.25 with a standalone signer and postgres+redis,
 upstream emulator v0.0.10-rc.0, `@arkade-os/sdk` 0.5.6); see `spike/`.
 
 | §13 item | Result |
@@ -350,9 +383,9 @@ upstream emulator v0.0.10-rc.0, `@arkade-os/sdk` 0.5.6); see `spike/`.
 | 3 Floor | ✔ holds across 3 chained partial fills; `min_fill` enforced |
 | 4 Epoch bump | ✔ owner-leaf self-spend cancels all old quotes |
 | 5 Two-asset offer VTXO | ✔ fills in both directions, payments land in the change |
-| 6 Two makers, several takers | ✔ index pairing blocks shared-output attacks; 59 takers per maker, 20 makers per tx (one-direction 203-byte Fill leaves, 40-byte quote) |
+| 6 Two makers, several takers | ✔ index pairing blocks shared-output attacks; 59 takers per maker, 19 makers per tx (one-direction 219-byte Fill leaves, 40-byte quote) |
 | 7 Dust | ✔ exact sats both ways; maker never pays taker dust and vice versa |
-| 8 Swap covenant | ✔ fill at/above `min_rate`, fee, exact-out, deadline refund, key refund |
+| 8 Swap covenant | ✔ fill at/above `min_rate` (net of fee), fee, exact-out, deadline refund, key refund, uneven amounts; Fill and Refund-anyone refuse batch intents |
 | 9 Renew leaf | ✔ exact-value renewal settles fee-free through a real batch inside the fee window; the fee-capped variant also renews sats + USD through a batch |
 | 10 Chain depth | ✔ no limit (1 000 deep), ~30 ms per fill |
-| 11 L1 exit | ✔ 3 unroll packages (~0.7 k sats) + 146 vB owner-only exit after the CSV |
+| 11 L1 exit | ✔ 3 unroll packages (~0.7 k sats) + owner-only exit after the CSV, carrying the asset packet; L1 asset recovery is open (§14) |

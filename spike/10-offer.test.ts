@@ -5,7 +5,8 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { attachPrevArkTxs, Transaction } from '@arkade-os/sdk';
 import { b64, coinAt, coinsAt, connect, disposeWallets, refused, regtest, secret, submitBuilt, submitToArkd, unb64, waitFor, walletCoins } from './harness.js';
-import { SELL_BTC, SELL_USD, assetIdsOf, buildTx, demoUsd, ensureFunded, sweepOffer, finalWeight, makerLeg, minReceived, offerTree, ownerInput, signQuote,
+import { schnorr } from '@noble/curves/secp256k1.js';
+import { OFF, SELL_BTC, SELL_USD, assetIdsOf, buildTx, demoUsd, encodeQuote, ensureFunded, sweepOffer, finalWeight, makerLeg, minReceived, offerTree, ownerInput, quoteHash, signQuote,
   usdOf, walletInput, type Coin, type FillPlan, type Offer, type Quote, type QuoteContext, type TxOutput } from './offer.js';
 
 const USD = 100_000_000n;                     // one demo USD in atomic units (8 decimals)
@@ -96,6 +97,16 @@ test('offer covenant: quotes, floor, epoch, two assets, dust', { timeout: 600_00
     const sellUsdSig = signQuote(offer, { ...cheap, side: SELL_USD }, secret(20)).signature;  // ... carrying the maker's genuine sell-USD signature
     await refusedFill(fill(plan(cheap, 10_000n, { signature: sellUsdSig }), await takerUsdCoin()), badSig);
     await refusedFill(fill(plan(sellBtc({ expiry: now() - 5n }), 10_000n), await takerUsdCoin()), /OP_VERIFY failed/);
+    // A field ≥ 2^63 would read as negative (BIN2NUM takes the top bit as the sign) and void its
+    // check, e.g. a negative rate_num sells for nothing. The covenant range-checks every field, so
+    // even a maker signer that skipped the u63 rule cannot be filled on such a quote.
+    for (const [field, off] of Object.entries({ rateNum: OFF.rateNum, rateDen: OFF.rateDen, floor: OFF.floor, minFill: OFF.minFill })) {
+      const message = encodeQuote(q);
+      message[off + 7] = message[off + 7]! | 0x80;
+      const signature = schnorr.sign(quoteHash(offer, SELL_BTC, message), secret(20));
+      const p = { ...plan(q, 10_000n, field === 'rateNum' ? { received: 0n } : {}), message, signature };
+      await refusedFill(fill(p, await takerUsdCoin()), /OP_VERIFY failed/);
+    }
     // Underpayment by one unit is refused; the exact rounded-up amount fills.
     await refusedFill(fill(plan(q, 10_000n, { received: minReceived(q, 10_000n) - 1n }), await takerUsdCoin()), /OP_VERIFY failed/);
     const r = await settle(await fill(plan(q, 10_000n), await takerUsdCoin()));
