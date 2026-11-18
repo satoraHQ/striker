@@ -55,14 +55,14 @@ export function App() {
         </div>
       )}
 
-      <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_minmax(0,22rem)]">
+      <div className="grid grid-cols-[minmax(0,1fr)] gap-4 md:grid-cols-[minmax(0,1fr)_minmax(0,22rem)]">
         <div className="space-y-4">
           {activeId && active ? (
             <SwapPanel key={active.id} record={active} info={info.data} onClose={() => open(undefined)} />
           ) : (
             <>
               {activeId && <p className="rounded-xl bg-white/5 px-3 py-2 text-sm text-slate-400">Swap {activeId} isn't stored in this browser.</p>}
-              <SwapForm info={info.data} onCreated={(id) => open(id)} />
+              <SwapForm info={info.data} book={book.data} onCreated={(id) => open(id)} />
             </>
           )}
         </div>

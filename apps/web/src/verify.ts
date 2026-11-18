@@ -1,7 +1,10 @@
 // Trust minimisation: rebuild the swap covenant from its terms and our own inputs before showing
 // the deposit address. The emulator key comes from the SDK's pinned key, never from the server.
 import { ArkAddress, defaultEmulatorPubkey, networks, type Network } from '@arkade-os/sdk';
-import { BTC, equalBytes, hex, swapCovenant, termsFromWire, unhex, type CreateSwapRequest, type InfoResponse, type SwapView } from '@striker/core';
+import {
+  BTC, equalBytes, hex, minRateFor, swapCovenant, termsFromWire, unhex,
+  type BookSnapshot, type CreateSwapRequest, type InfoResponse, type SwapView,
+} from '@striker/core';
 
 export function pinnedEmulatorKey(networkName: string): Uint8Array {
   const network = (networks as Record<string, Network>)[networkName];
@@ -20,8 +23,23 @@ export function addressError(addr: string, info: Pick<InfoResponse, 'network' | 
   return null;
 }
 
+export interface Rate { num: string; den: string }
+
+/**
+ * The least rate the user accepts: the best quote in the book the user is looking at (the maker
+ * side that buys what the user sells), net of Striker's fee and the user's slippage. Undefined
+ * without a quote on that side.
+ */
+export function rateFloor(book: BookSnapshot | undefined, sell: CreateSwapRequest['sell'], feeBps: string, slippageBps: number): Rate | undefined {
+  // The user sells BTC to makers who sell the asset (bids), and the asset to makers who sell BTC (asks).
+  const best = (sell === 'BTC' ? book?.bids : book?.asks)?.[0];
+  if (!best) return undefined;
+  const r = minRateFor({ rateNum: BigInt(best.rateNum), rateDen: BigInt(best.rateDen) }, BigInt(feeBps), BigInt(slippageBps));
+  return { num: String(r.num), den: String(r.den) };
+}
+
 /** Returns the list of failed checks; empty means the address is safe to show. */
-export function verifySwap(view: SwapView, info: InfoResponse, req: CreateSwapRequest, amountBase: bigint): string[] {
+export function verifySwap(view: SwapView, info: InfoResponse, req: CreateSwapRequest, amountBase: bigint, floor?: Rate): string[] {
   const errs: string[] = [];
   const check = (ok: boolean, msg: string) => { if (!ok) errs.push(msg); };
   try {
@@ -45,6 +63,9 @@ export function verifySwap(view: SwapView, info: InfoResponse, req: CreateSwapRe
 
     if (view.deposit.asset) check(view.deposit.asset.id === info.asset.id, 'Deposit asks for an unexpected asset');
     check(req.sell === 'ASSET' ? !!view.deposit.asset : !view.deposit.asset, 'Deposit instructions do not match the direction');
+    // The guaranteed rate (buy units per sell unit) must be at least what the user agreed to.
+    if (floor) check(terms.rate.num * BigInt(floor.den) >= BigInt(floor.num) * terms.rate.den,
+      'Covenant guarantees a worse rate than the quote minus your slippage');
     check(Number(terms.deadline) * 1000 > Date.now(), 'Deadline is already in the past');
   } catch (e) {
     errs.push(`Could not verify the address: ${(e as Error).message}`);

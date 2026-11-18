@@ -7,8 +7,8 @@
     "check": "tsc --noEmit -p tsconfig.json",
     "regtest": "node scripts/regtest.mjs",
     "spike": "node --import tsx --test --test-concurrency=1 spike/*.test.ts",
-    "test": "npm test --workspaces --if-present",
-    "e2e": "node --import tsx --test --test-concurrency=1 packages/core/test/*.regtest.test.ts apps/striker/test/*.regtest.test.ts",
+    "test": "node --import tsx --test packages/core/test/unit.test.ts apps/web/test/unit.test.ts",
+    "e2e": "node --import tsx --test --test-concurrency=1 packages/core/test/*.regtest.test.ts apps/striker/test/*.test.ts && npm run e2e -w apps/web",
     "dev": "node --import tsx scripts/dev.ts"
   },
   "dependencies": {

@@ -22,8 +22,21 @@ npm run dev                         # funds a dev maker, starts Striker (:7090),
 npm run dev -- faucet <ark address> # regtest sats + $500 demo USD for a wallet to swap from
 ```
 
-Tests: `npm run check` (types), `npm run e2e` (core settlement, Striker + maker end to end, renewal;
-needs the regtest stack), `npm run spike` (covenant spike).
+### Tests
+
+```sh
+npm run check   # types, all packages and tests
+npm test        # offline unit and property tests (core quote/pricing/settlement, web units and verification)
+npm run e2e     # on the regtest stack: core settlement txs, Striker + maker end to end, renewal,
+                # then the web app in Chromium (Playwright): real swaps paid from a wallet, refunds,
+                # tampered-terms rejection, validation, offline state, PWA, phone layout
+npm run spike   # covenant spike
+```
+
+The browser suite alone: `npm run e2e -w apps/web` (first time: `npx playwright install --with-deps chromium`).
+It builds the app, serves it with `vite preview` on :5183 and starts its own Striker (:7190) and maker.
+Test wallets have keys derived from their names and are funded from a bank wallet that tops up from
+the regtest faucet and issues the demo USD ([scripts/testnet.ts](./scripts/testnet.ts)).
 
 ## History
 

@@ -6,6 +6,9 @@ export interface SwapRecord {
   createdAt: number;
   request: CreateSwapRequest;
   lastStatus?: SwapStatus;
+  /** The least the covenant may guarantee (buy units per sell unit): the best book quote the user
+   * saw, net of fee and their slippage. Checked against the terms Striker returns. */
+  minRate?: { num: string; den: string };
 }
 
 const LIST = 'striker:swaps';

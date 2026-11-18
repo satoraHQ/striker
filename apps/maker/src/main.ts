@@ -54,18 +54,22 @@ log(`offer ${offer.address} (epoch ${epoch})`);
 
 const coins = async () => (await indexer.getVtxos({ scripts: [hex(offer.tree.pkScript)], spendableOnly: true })).vtxos;
 
-/** One VTXO per offer (DESIGN.md §3 floor): fund it if empty, merge through the Owner leaf if split. */
+/** One VTXO per offer (DESIGN.md §3 floor): fund it if empty or drained below half the target on
+ * either side, and merge through the Owner leaf when it is split. */
 async function ensureOffer() {
   const have = await coins();
-  if (have.length === 0) {
-    log(`funding offer with ${fundSats} sats + ${fundAsset} ${info.asset.ticker} units`);
-    await wallet.send({ address: offer.address, amount: Number(fundSats), assets: fundAsset > 0n ? [{ assetId, amount: fundAsset }] : [] });
-    return;
-  }
-  if (have.length === 1) return;
   const sats = have.reduce((s, c) => s + BigInt(c.value), 0n);
   const totals = new Map<string, bigint>();
   for (const c of have) for (const a of c.assets ?? []) totals.set(a.assetId, (totals.get(a.assetId) ?? 0n) + BigInt(a.amount));
+  const units = totals.get(assetId) ?? 0n;
+  if (sats < fundSats / 2n || units < fundAsset / 2n) {
+    const addSats = sats < fundSats ? fundSats - sats : 0n, addUnits = units < fundAsset ? fundAsset - units : 0n;
+    log(`topping up offer with ${addSats} sats + ${addUnits} ${info.asset.ticker} units`);
+    await wallet.send({ address: offer.address, amount: Number(addSats > BigInt(info.dust) ? addSats : BigInt(info.dust)),
+      assets: addUnits > 0n ? [{ assetId, amount: addUnits }] : [] });
+    return;
+  }
+  if (have.length <= 1) return;
   const built = await buildTx(chain, have.map(c => ({ coin: c, tapTree: offer.tree.encode(), tapLeafScript: offer.tree.leaves[OFFER_LEAF.owner]!, signer: identity })),
     [{ script: offer.tree.pkScript, amount: sats, assets: [...totals].map(([id, amount]) => ({ assetId: id, amount })) }]);
   const { txid } = await submitViaArkd(ark, built);
@@ -105,7 +109,7 @@ for (;;) {
     const { price, source } = await publish();
     const line = `${source} ${price.toFixed(2)}`;
     if (line !== last) { log(`quoting around ${line} ± ${spreadBps} bps`); last = line; }
-    if (Date.now() - lastMerge > 60_000) { lastMerge = Date.now(); await ensureOffer(); }
+    if (Date.now() - lastMerge > 20_000) { lastMerge = Date.now(); await ensureOffer(); }
   } catch (e) { log((e as Error).message); }
   await new Promise(r => setTimeout(r, requoteMs));
 }

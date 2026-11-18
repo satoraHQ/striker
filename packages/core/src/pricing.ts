@@ -9,7 +9,7 @@ export const reduce = (r: { num: bigint; den: bigint }) => { const g = gcd(r.num
  * maker sells, the user gets `rate_den / rate_num` of it per unit the maker receives:
  * min_rate = maker_rate × (1 − fee) × (1 − slippage).
  */
-export function minRateFor(q: Quote, feeBps: bigint, slippageBps: bigint) {
+export function minRateFor(q: Pick<Quote, 'rateNum' | 'rateDen'>, feeBps: bigint, slippageBps: bigint) {
   if (feeBps < 0n || feeBps >= 10_000n || slippageBps < 0n || slippageBps >= 10_000n) throw new RangeError('bps out of range');
   return reduce({ num: q.rateDen * (10_000n - feeBps) * (10_000n - slippageBps), den: q.rateNum * 100_000_000n });
 }

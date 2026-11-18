@@ -20,8 +20,9 @@ export interface Config {
   swapTtl: number;
   /** Renew window in seconds; part of every offer address, so keep it stable. */
   renewWindow?: bigint;
-  offerExitSeconds: bigint;
-  swapExitSeconds: bigint;
+  /** CSV delays of the offer and swap exit leaves; default to arkd's unilateral exit delay. */
+  offerExitSeconds?: bigint;
+  swapExitSeconds?: bigint;
   batchWindowMs: number;
   /** Renew an offer VTXO once it has less than this many seconds left (clamped to the window). */
   renewBefore: number;
@@ -50,8 +51,8 @@ export function loadConfig(): Config {
     feeBps: BigInt(env('FEE_BPS', '30')),
     swapTtl: Number(env('SWAP_TTL', '600')),
     ...(process.env.RENEW_WINDOW ? { renewWindow: BigInt(process.env.RENEW_WINDOW) } : {}),
-    offerExitSeconds: BigInt(env('OFFER_EXIT_SECONDS', '1536')),
-    swapExitSeconds: BigInt(env('SWAP_EXIT_SECONDS', '1536')),
+    ...(process.env.OFFER_EXIT_SECONDS ? { offerExitSeconds: BigInt(process.env.OFFER_EXIT_SECONDS) } : {}),
+    ...(process.env.SWAP_EXIT_SECONDS ? { swapExitSeconds: BigInt(process.env.SWAP_EXIT_SECONDS) } : {}),
     batchWindowMs: Number(env('BATCH_WINDOW_MS', '200')),
     renewBefore: Number(env('RENEW_BEFORE', String(6 * 3600))),
     renewCheckMs: Number(env('RENEW_CHECK_MS', '30000')),

@@ -15,6 +15,8 @@ import {
   type PublishQuotesRequest, type RenewParams, type Side, type SignedQuote, type Swap, type SwapStatus, type SwapTerms, type SwapView,
 } from '@striker/core';
 import type { Config } from './config.js';
+
+type ResolvedConfig = Config & Required<Pick<Config, 'offerExitSeconds' | 'swapExitSeconds'>>;
 import { renewalFee, renewOffer, type RenewDeps } from './renew.js';
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -52,7 +54,7 @@ export class Striker extends EventEmitter {
   readonly identity: SingleKey;
 
   private constructor(
-    readonly config: Config, readonly chain: ChainParams, readonly renew: RenewParams,
+    readonly config: ResolvedConfig, readonly chain: ChainParams, readonly renew: RenewParams,
     readonly ark: RestArkProvider, readonly indexer: RestIndexerProvider, readonly emulator: RestEmulatorProvider,
     readonly feeWallet: Wallet, readonly feeScript: Uint8Array, readonly feeAddress: string,
   ) {
@@ -61,9 +63,11 @@ export class Striker extends EventEmitter {
     this.load();
   }
 
-  static async create(config: Config) {
-    const ark = new RestArkProvider(config.arkUrl);
+  static async create(cfg: Config) {
+    const ark = new RestArkProvider(cfg.arkUrl);
     const info = await ark.getInfo();
+    const exit = BigInt(info.unilateralExitDelay);
+    const config: ResolvedConfig = { ...cfg, offerExitSeconds: cfg.offerExitSeconds ?? exit, swapExitSeconds: cfg.swapExitSeconds ?? exit };
     const chain = await fetchChainParams(config.arkUrl, process.env.EMULATOR_KEY);
     const identity = SingleKey.fromPrivateKey(config.secret);
     // Renewal is free while a VTXO has less than W seconds left (arkd intent fee program, DESIGN.md §8).

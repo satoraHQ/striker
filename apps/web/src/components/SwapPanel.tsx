@@ -16,8 +16,8 @@ export function SwapPanel({ record, info, onClose }: { record: SwapRecord; info:
   const amountBase = useMemo(() => BigInt(record.request.amount), [record.request.amount]);
   // Re-run whenever the server's terms or address could differ (they never should).
   const errors = useMemo(
-    () => (view && info ? verifySwap(view, info, record.request, amountBase) : null),
-    [view?.address, JSON.stringify(view?.terms), info, record.request, amountBase],
+    () => (view && info ? verifySwap(view, info, record.request, amountBase, record.minRate) : null),
+    [view?.address, JSON.stringify(view?.terms), info, record.request, amountBase, record.minRate],
   );
 
   return (
@@ -91,7 +91,7 @@ function Verified({ view, info, decimals, ticker, stale }: { view: SwapView; inf
           </div>
           <Qr text={view.address} />
           <div className="flex items-center gap-2 rounded-xl border border-line bg-black/30 p-2">
-            <code className="min-w-0 flex-1 break-all text-xs">{view.address}</code>
+            <code className="min-w-0 flex-1 break-all text-xs" data-testid="deposit-address">{view.address}</code>
             <CopyButton text={view.address} />
           </div>
         </div>

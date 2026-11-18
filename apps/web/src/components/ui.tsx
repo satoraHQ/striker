@@ -37,7 +37,7 @@ export function Qr({ text, size = 240 }: { text: string; size?: number }) {
 
 export function Row({ label, children, strong }: { label: ReactNode; children: ReactNode; strong?: boolean }) {
   return (
-    <div className="flex items-baseline justify-between gap-3 py-1 text-sm">
+    <div className="flex items-baseline justify-between gap-3 py-1 text-sm" data-row={typeof label === 'string' ? label : undefined}>
       <span className="text-slate-400">{label}</span>
       <span className={`text-right tabular-nums ${strong ? 'font-semibold text-white' : 'text-slate-200'}`}>{children}</span>
     </div>
@@ -53,6 +53,7 @@ export function Seg<T extends string | number>({ value, options, onChange }: {
         <button
           key={String(o.value)}
           type="button"
+          aria-pressed={value === o.value}
           onClick={() => onChange(o.value)}
           className={`flex-1 rounded-lg px-2 py-1.5 text-sm font-medium transition ${value === o.value ? 'bg-accent text-slate-900' : 'text-slate-300 hover:text-white'}`}
         >

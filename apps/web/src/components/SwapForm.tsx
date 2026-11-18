@@ -1,20 +1,22 @@
 import { schnorr } from '@noble/curves/secp256k1.js';
 import { useMutation } from '@tanstack/react-query';
 import { useMemo, useState } from 'react';
-import { hex, type CreateSwapRequest, type InfoResponse } from '@striker/core';
+import { hex, type BookSnapshot, type CreateSwapRequest, type InfoResponse } from '@striker/core';
 import { api, ApiError, OfflineError } from '../api';
 import { usePreview } from '../hooks';
 import { saveRefundKey, saveSwap } from '../storage';
 import { fmtBtc, fmtPrice, fmtSats, fmtUsd, parseUnits } from '../units';
-import { addressError } from '../verify';
+import { addressError, rateFloor } from '../verify';
 import { Card, Row, Seg } from './ui';
 
 type Sell = CreateSwapRequest['sell'];
 type Mode = CreateSwapRequest['mode'];
 
-const SLIPPAGE = [0, 10, 50, 100] as const;
+// No 0%: the fee and the maker's payout round to whole units against the user, so a covenant with
+// no slippage at all fills only when the fee happens to divide exactly.
+const SLIPPAGE = [10, 50, 100] as const;
 
-export function SwapForm({ info, onCreated }: { info: InfoResponse | undefined; onCreated: (id: string) => void }) {
+export function SwapForm({ info, book, onCreated }: { info: InfoResponse | undefined; book: BookSnapshot | undefined; onCreated: (id: string) => void }) {
   const [sell, setSell] = useState<Sell>('BTC');
   const [mode, setMode] = useState<Mode>('exactIn');
   const [amount, setAmount] = useState('');
@@ -48,9 +50,11 @@ export function SwapForm({ info, onCreated }: { info: InfoResponse | undefined; 
     mutationFn: async () => {
       const secret = schnorr.utils.randomSecretKey();
       const req: CreateSwapRequest = { ...previewReq!, receiveAddress: receive.trim(), refundAddress: refundAddr.trim(), refundPubkey: hex(schnorr.getPublicKey(secret)) };
+      // Pin the rate the user is agreeing to before asking Striker for terms.
+      const minRate = rateFloor(book, sell, info!.feeBps, slippageBps);
       const view = await api.createSwap(req);
       saveRefundKey(view.id, hex(secret));
-      saveSwap({ id: view.id, createdAt: Date.now(), request: req, lastStatus: view.status });
+      saveSwap({ id: view.id, createdAt: Date.now(), request: req, lastStatus: view.status, ...(minRate ? { minRate } : {}) });
       return view;
     },
     onSuccess: (view) => onCreated(view.id),
