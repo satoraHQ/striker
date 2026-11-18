@@ -1,5 +1,5 @@
 {
   "extends": "./tsconfig.base.json",
-  "compilerOptions": { "noEmit": true },
-  "include": ["spike/**/*.ts", "scripts/**/*.ts"]
+  "compilerOptions": { "noEmit": true, "allowImportingTsExtensions": true },
+  "include": ["spike/**/*.ts", "scripts/**/*.ts", "packages/*/src/**/*.ts", "packages/*/test/**/*.ts", "apps/striker/**/*.ts", "apps/maker/**/*.ts"]
 }
